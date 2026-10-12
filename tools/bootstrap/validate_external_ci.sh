@@ -103,7 +103,7 @@ collect_lifecycle_tests() {
   local discovered=""
   local discovery_exit=0
   set +e
-  discovered="$(find tests -type f \( -name "*lifecycle*.py" -o -path "*/lifecycle/*" \) | sort)"
+  discovered="$(find tests -type f -name "*.py" \( -name "*lifecycle*.py" -o -path "*/lifecycle/*" \) | sort)"
   discovery_exit=$?
   set -e
 
