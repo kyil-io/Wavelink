@@ -33,11 +33,12 @@ From a clean checkout of the exact PR head SHA:
      validation.
 
 2. Run the helper against the supported interpreter matrix:
-   minimum supported Python (`3.10`, per `pyproject.toml`) and current Python
-   (`3.x`, equivalent to the removed matrix workflow behavior).
+   minimum supported Python (`3.10`, per `pyproject.toml`) and a current
+   interpreter (`3.12` on the kyil-ci runner fleet today). For each matrix
+   entry, create a venv **outside** the repository checkout, install the
+   toolchain, run the helper while that venv is active, then deactivate.
 
-   For each matrix entry, use a venv **outside** the repository checkout and
-   install the CI toolchain:
+   **Python 3.10 lane**
 
    `python3.10 -m venv ../.venv-extci-wavelink-py310 && . ../.venv-extci-wavelink-py310/bin/activate`
 
@@ -45,15 +46,23 @@ From a clean checkout of the exact PR head SHA:
 
    `python -m pip install -r requirements.txt ruff pyright build pytest`
 
+   - Mature branches:
+
+     `tools/bootstrap/validate_external_ci.sh --mode normal`
+
+   - Initial bootstrap PRs before lifecycle tests exist:
+
+     `tools/bootstrap/validate_external_ci.sh --mode bootstrap-only`
+
    `deactivate`
 
-   `python3 -m venv ../.venv-extci-wavelink-current && . ../.venv-extci-wavelink-current/bin/activate`
+   **Current lane (3.12 on kyil-ci)**
+
+   `python3.12 -m venv ../.venv-extci-wavelink-current && . ../.venv-extci-wavelink-current/bin/activate`
 
    `python -m pip install --upgrade pip`
 
    `python -m pip install -r requirements.txt ruff pyright build pytest`
-
-3. Run validation on **each** matrix interpreter:
 
    - Mature branches:
 
@@ -66,6 +75,8 @@ From a clean checkout of the exact PR head SHA:
      In this mode the helper prints `LIFECYCLE_SUITE=NOT PRESENT` (never
      "0 tests passed").
 
-4. Post the required commit status on the exact head SHA under context
+   `deactivate`
+
+3. Post the required commit status on the exact head SHA under context
    `bootstrap/kyil-ci-trusted` **only after all matrix helper runs pass**, and
    include a link to the raw execution transcript.
