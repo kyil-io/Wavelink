@@ -160,6 +160,11 @@ if [[ "$collect_exit" -ne 0 ]]; then
 fi
 
 if [[ "$lifecycle_count" -eq 0 ]]; then
+  if [[ "$MODE" == "bootstrap-only" ]]; then
+    echo "LIFECYCLE_SUITE=NOT PRESENT"
+    exit 0
+  fi
+
   echo "LIFECYCLE_SUITE=REQUIRED_BUT_MISSING" >&2
   exit 14
 fi
