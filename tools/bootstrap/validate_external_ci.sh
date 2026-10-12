@@ -61,6 +61,11 @@ if [[ -n "$SMOKE_FAIL_STEP" ]]; then
   fi
 fi
 
+if [[ "$MODE" == "bootstrap-only" && "$SMOKE_FAIL_STEP" == "lifecycle" ]]; then
+  echo "Invalid option combination: --smoke-fail-step lifecycle requires --mode normal" >&2
+  exit 2
+fi
+
 maybe_smoke_fail() {
   local step="$1"
   if [[ -n "$SMOKE_FAIL_STEP" && "$SMOKE_FAIL_STEP" == "$step" ]]; then
