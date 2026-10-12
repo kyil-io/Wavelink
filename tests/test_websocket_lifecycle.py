@@ -473,7 +473,9 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
         )
         try:
             await asyncio.wait_for(wavelink.Pool.connect(nodes=[fixture.node], client=self.client), timeout=5.0)
-            await asyncio.wait_for(self.client.wait_for("wavelink_node_ready", timeout=5.0), timeout=5.0)
+            await self._wait_until(
+                lambda: fixture.node.status is wavelink.NodeStatus.CONNECTED and fixture.node.session_id is not None
+            )
             fixture.session_spy.close_gate = TransportCloseGate(
                 close_error=RuntimeError("synthetic-node-close-failure"),
             )
@@ -507,8 +509,12 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(
             wavelink.Pool.connect(nodes=[fixture_a.node, fixture_b.node], client=self.client), timeout=5.0
         )
-        await asyncio.wait_for(self.client.wait_for("wavelink_node_ready", timeout=5.0), timeout=5.0)
-        await asyncio.wait_for(self.client.wait_for("wavelink_node_ready", timeout=5.0), timeout=5.0)
+        await self._wait_until(
+            lambda: all(
+                fixture.node.status is wavelink.NodeStatus.CONNECTED and fixture.node.session_id is not None
+                for fixture in (fixture_a, fixture_b)
+            )
+        )
 
         pool_close_task = asyncio.create_task(wavelink.Pool.close())
         eject_task = asyncio.create_task(fixture_a.node.close(eject=True))
