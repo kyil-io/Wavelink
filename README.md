@@ -92,7 +92,25 @@ For spotify support, simply install and use [LavaSrc](https://github.com/topi314
 ## Maintainer notes for this fork
 
 - This fork accepts changes only through pull requests to `main`.
-- Public PR automation runs only on owner-controlled branches in this repository.
-  External fork heads are excluded from self-hosted runner execution.
+- GitHub Actions are intentionally disabled in repository settings for this fork.
+- Required CI context `bootstrap/kyil-ci-trusted` is posted from an external,
+  isolated maintainer-run job on `kyil-ci-01`/`kyil-ci-02`.
 - Release publishing workflows are intentionally omitted from this fork baseline.
   Build and release operations are handled through reviewed maintainer procedures.
+
+### External-only required CI procedure
+
+From a clean checkout of the exact PR head SHA:
+
+1. Create an isolated workspace (unique per run), install toolchain deps, then run:
+
+   `tools/bootstrap/validate_external_ci.sh --mode normal`
+
+2. For initial bootstrap PRs before lifecycle tests exist, run:
+
+   `tools/bootstrap/validate_external_ci.sh --mode bootstrap-only`
+
+   In this mode the helper prints `LIFECYCLE_SUITE=NOT PRESENT` (never "0 tests passed").
+
+3. Post the result to GitHub commit status on the exact head SHA under context
+   `bootstrap/kyil-ci-trusted`, including a link to the raw execution transcript.
