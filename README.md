@@ -102,9 +102,20 @@ For spotify support, simply install and use [LavaSrc](https://github.com/topi314
 
 From a clean checkout of the exact PR head SHA:
 
-1. Create an isolated workspace (unique per run), create a venv, and install the CI toolchain:
+0. **Trust gate (mandatory before any install/import/build/test command):**
 
-   `python -m venv .venv-extci && . .venv-extci/bin/activate`
+   - A trusted maintainer must explicitly select and audit the exact commit SHA to validate.
+   - Do **not** run PR-controlled code on shared CI runners until that audit is complete.
+   - A unique workspace and a Python venv are operational hygiene only; they are **not** a security sandbox.
+   - Never schedule this automatically for untrusted external PRs.
+   - External contributions must be fully reviewed and adopted onto a maintainer-owned branch first.
+   - If code is still untrusted, validate only inside a disposable, credential-free VM (not on `kyil-ci-01`/`kyil-ci-02`).
+   - Keep commit-status credentials scoped to the trusted controller path only.
+   - Run as the existing unprivileged CI job user; do not use root for validation.
+
+1. Create an isolated workspace (unique per run), create a venv **outside** the repository checkout, and install the CI toolchain:
+
+   `python -m venv ../.venv-extci-wavelink && . ../.venv-extci-wavelink/bin/activate`
 
    `python -m pip install --upgrade pip`
 

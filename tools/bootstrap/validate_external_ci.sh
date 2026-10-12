@@ -90,7 +90,31 @@ run_step() {
 }
 
 collect_lifecycle_tests() {
-  find tests -type f \( -name "*lifecycle*.py" -o -path "*/lifecycle/*" \) 2>/dev/null | sort
+  if [[ ! -e tests ]]; then
+    echo "LIFECYCLE_DISCOVERY=tests-dir-absent"
+    return 3
+  fi
+
+  if [[ ! -d tests ]]; then
+    echo "LIFECYCLE_DISCOVERY_ERROR=tests path exists but is not a directory: tests" >&2
+    return 21
+  fi
+
+  local discovered=""
+  local discovery_exit=0
+  set +e
+  discovered="$(find tests -type f \( -name "*lifecycle*.py" -o -path "*/lifecycle/*" \) | sort)"
+  discovery_exit=$?
+  set -e
+
+  if [[ "$discovery_exit" -ne 0 ]]; then
+    echo "LIFECYCLE_DISCOVERY_ERROR=find/sort failed while discovering lifecycle tests (exit=$discovery_exit)" >&2
+    return "$discovery_exit"
+  fi
+
+  if [[ -n "$discovered" ]]; then
+    printf '%s\n' "$discovered"
+  fi
 }
 
 echo "VALIDATION_MODE=$MODE"
@@ -104,16 +128,38 @@ run_step typecheck pyright
 run_step import python -c "import wavelink; print(wavelink.__version__)"
 run_step build python -m build
 
-mapfile -t lifecycle_tests < <(collect_lifecycle_tests)
+collect_output=""
+collect_exit=0
+set +e
+collect_output="$(collect_lifecycle_tests)"
+collect_exit=$?
+set -e
+
+lifecycle_tests=()
+if [[ "$collect_exit" -eq 0 && -n "$collect_output" ]]; then
+  mapfile -t lifecycle_tests <<< "$collect_output"
+fi
+
 lifecycle_count="${#lifecycle_tests[@]}"
 echo "LIFECYCLE_TEST_FILES=$lifecycle_count"
 
-if [[ "$lifecycle_count" -eq 0 ]]; then
+if [[ "$collect_exit" -eq 3 ]]; then
   if [[ "$MODE" == "bootstrap-only" ]]; then
     echo "LIFECYCLE_SUITE=NOT PRESENT"
     exit 0
   fi
 
+  echo "LIFECYCLE_DISCOVERY_ERROR=tests directory is missing" >&2
+  echo "LIFECYCLE_SUITE=REQUIRED_BUT_MISSING" >&2
+  exit 14
+fi
+
+if [[ "$collect_exit" -ne 0 ]]; then
+  echo "LIFECYCLE_SUITE=DISCOVERY_FAILED" >&2
+  exit "$collect_exit"
+fi
+
+if [[ "$lifecycle_count" -eq 0 ]]; then
   echo "LIFECYCLE_SUITE=REQUIRED_BUT_MISSING" >&2
   exit 14
 fi
