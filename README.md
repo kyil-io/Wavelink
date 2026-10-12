@@ -88,3 +88,11 @@ For spotify support, simply install and use [LavaSrc](https://github.com/topi314
 - Wavelink **3** is compatible with Lavalink **v4+**.
 - Wavelink has built in support for Lavalink Plugins including LavaSrc and SponsorBlock.
 - Wavelink is fully typed in compliance with Pyright Strict, though some nuances remain between discord.py and wavelink.
+
+## Maintainer notes for this fork
+
+- This fork accepts changes only through pull requests to `main`.
+- Public PR automation runs only on owner-controlled branches in this repository.
+  External fork heads are excluded from self-hosted runner execution.
+- Release publishing workflows are intentionally omitted from this fork baseline.
+  Build and release operations are handled through reviewed maintainer procedures.
