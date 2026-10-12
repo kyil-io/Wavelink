@@ -102,15 +102,23 @@ For spotify support, simply install and use [LavaSrc](https://github.com/topi314
 
 From a clean checkout of the exact PR head SHA:
 
-1. Create an isolated workspace (unique per run), install toolchain deps, then run:
+1. Create an isolated workspace (unique per run), create a venv, and install the CI toolchain:
+
+   `python -m venv .venv-extci && . .venv-extci/bin/activate`
+
+   `python -m pip install --upgrade pip`
+
+   `python -m pip install -r requirements.txt ruff pyright build pytest`
+
+2. Run validation:
 
    `tools/bootstrap/validate_external_ci.sh --mode normal`
 
-2. For initial bootstrap PRs before lifecycle tests exist, run:
+3. For initial bootstrap PRs before lifecycle tests exist, run:
 
    `tools/bootstrap/validate_external_ci.sh --mode bootstrap-only`
 
    In this mode the helper prints `LIFECYCLE_SUITE=NOT PRESENT` (never "0 tests passed").
 
-3. Post the result to GitHub commit status on the exact head SHA under context
+4. Post the result to GitHub commit status on the exact head SHA under context
    `bootstrap/kyil-ci-trusted`, including a link to the raw execution transcript.

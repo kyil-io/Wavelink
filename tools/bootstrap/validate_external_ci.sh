@@ -4,6 +4,7 @@ IFS=$'\n\t'
 
 MODE="normal"
 SMOKE_FAIL_STEP=""
+VALID_STEPS=(lint format typecheck import build lifecycle)
 
 usage() {
   cat <<'USAGE'
@@ -45,6 +46,21 @@ if [[ "$MODE" != "normal" && "$MODE" != "bootstrap-only" ]]; then
   exit 2
 fi
 
+if [[ -n "$SMOKE_FAIL_STEP" ]]; then
+  is_valid_smoke_step=0
+  for valid_step in "${VALID_STEPS[@]}"; do
+    if [[ "$SMOKE_FAIL_STEP" == "$valid_step" ]]; then
+      is_valid_smoke_step=1
+      break
+    fi
+  done
+  if [[ "$is_valid_smoke_step" -eq 0 ]]; then
+    echo "Invalid --smoke-fail-step: $SMOKE_FAIL_STEP" >&2
+    echo "Allowed values: ${VALID_STEPS[*]}" >&2
+    exit 2
+  fi
+fi
+
 maybe_smoke_fail() {
   local step="$1"
   if [[ -n "$SMOKE_FAIL_STEP" && "$SMOKE_FAIL_STEP" == "$step" ]]; then
@@ -56,11 +72,21 @@ maybe_smoke_fail() {
 run_step() {
   local step="$1"
   shift
+  printf "STEP %s:" "$step"
+  printf " %q" "$@"
+  printf "\n"
+
+  set +e
   maybe_smoke_fail "$step"
-  echo "STEP $step: $*"
-  "$@"
   local exit_code=$?
+  if [[ "$exit_code" -eq 0 ]]; then
+    "$@"
+    exit_code=$?
+  fi
+  set -e
+
   echo "STEP $step: exit=$exit_code"
+  return "$exit_code"
 }
 
 collect_lifecycle_tests() {
