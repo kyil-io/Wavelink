@@ -657,7 +657,7 @@ class LifecycleFixtureRig:
         try:
             yield fixture
         finally:
-            await self.close_fixture(fixture, suppress_errors=True)
+            await self.close_fixture(fixture, suppress_node_close_error=True)
 
     @staticmethod
     def force_pool_remove(node: wavelink.Node) -> None:
