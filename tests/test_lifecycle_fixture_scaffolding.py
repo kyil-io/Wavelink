@@ -46,9 +46,10 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(rig.close_fixture, fixture, suppress_errors=True)
 
-        async with aiohttp.ClientSession() as session, session.ws_connect(
-            f"{fixture.server.uri}/v4/websocket"
-        ) as websocket:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.ws_connect(f"{fixture.server.uri}/v4/websocket") as websocket,
+        ):
             first = await websocket.receive_json()
             second = await websocket.receive_json()
             self.assertEqual(first, {"op": "ready", "resumed": False, "sessionId": "ready-handler-1"})
@@ -74,6 +75,42 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(f"{fixture.server.uri}/v4/websocket") as websocket:
                 close_message = await websocket.receive()
+                self.assertIn(
+                    close_message.type,
+                    (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING),
+                )
+
+            with self.assertRaises(aiohttp.WSServerHandshakeError) as raised:
+                await session.ws_connect(f"{fixture.server.uri}/v4/websocket")
+            self.assertEqual(raised.exception.status, 401)
+
+        await asyncio.wait_for(reconnect_attempted.wait(), timeout=1.0)
+
+    async def test_pre_ready_close_handler_wait_for_client_close_keeps_client_as_close_initiator(self) -> None:
+        reconnect_attempted = asyncio.Event()
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        fixture = await rig.make_node(
+            identifier="handler-pre-ready-client-close",
+            websocket_handler=make_pre_ready_close_then_handshake_failure_handler(
+                handshake_status=401,
+                reconnect_attempted=reconnect_attempted,
+                wait_for_client_close=True,
+            ),
+            managed=False,
+        )
+        self.addAsyncCleanup(rig.close_fixture, fixture, suppress_errors=True)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f"{fixture.server.uri}/v4/websocket") as websocket:
+                receive_task = asyncio.create_task(websocket.receive())
+                done, pending = await asyncio.wait({receive_task}, timeout=0.05)
+                self.assertFalse(done, "server should wait for client close when wait_for_client_close=True")
+                self.assertIn(receive_task, pending)
+                await websocket.close()
+                close_message = await asyncio.wait_for(receive_task, timeout=1.0)
                 self.assertIn(
                     close_message.type,
                     (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING),
