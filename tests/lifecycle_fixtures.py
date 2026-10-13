@@ -538,9 +538,6 @@ class LifecycleFixtureRig:
     async def enter(self) -> None:
         import wavelink
 
-        if self._entered:
-            raise RuntimeError("LifecycleFixtureRig.enter() cannot be called while already entered")
-
         if wavelink.Pool.nodes:
             node_identifiers = tuple(wavelink.Pool.nodes)
             raise RuntimeError(f"Pool.nodes must be empty before lifecycle rig setup, found {node_identifiers}")

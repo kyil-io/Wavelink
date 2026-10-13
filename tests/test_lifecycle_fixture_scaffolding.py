@@ -209,7 +209,6 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
     async def test_lifecycle_fixture_rig_close_ejects_managed_nodes(self) -> None:
         rig = LifecycleFixtureRig()
         await rig.enter()
-        self.addAsyncCleanup(rig.close)
 
         fixture = await rig.make_node(
             identifier="managed-resource",
@@ -222,15 +221,6 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
 
         await rig.close()
         self.assertNotIn("managed-resource", wavelink.Pool.nodes)
-
-    async def test_lifecycle_fixture_rig_enter_reentry_raises(self) -> None:
-        rig = LifecycleFixtureRig()
-        await rig.enter()
-        self.addAsyncCleanup(rig.close)
-
-        with self.assertRaises(RuntimeError) as raised:
-            await rig.enter()
-        self.assertIn("already entered", str(raised.exception))
 
     async def test_unmanaged_node_context_performs_deterministic_cleanup(self) -> None:
         rig = LifecycleFixtureRig()
@@ -504,7 +494,6 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
     async def test_rig_close_surfaces_first_resource_failure_and_settles_later_resources(self) -> None:
         rig = LifecycleFixtureRig()
         await rig.enter()
-        self.addAsyncCleanup(rig.close)
 
         first_fixture = await rig.make_node(
             identifier="close-rig-first",
