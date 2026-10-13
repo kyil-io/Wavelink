@@ -413,11 +413,14 @@ class SameIdentifierConnectRace:
     async def cancel_and_drain(self, *, timeout: float = 5.0) -> None:
         self.first_gate.release()
         self.second_gate.release()
-        for task in (self.first_task, self.second_task):
+        tasks = (self.first_task, self.second_task)
+        for task in tasks:
             if task.done():
                 continue
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(task, timeout=timeout)
 
 
@@ -526,22 +529,30 @@ class LifecycleFixtureRig:
     async def close_fixture(self, fixture: FixtureNode, *, suppress_errors: bool = False) -> None:
         import wavelink
 
+        first_error: BaseException | None = None
+
         async def run(operation: Awaitable[Any]) -> None:
-            if suppress_errors:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(operation, timeout=5.0)
-                return
-            await asyncio.wait_for(operation, timeout=5.0)
+            nonlocal first_error
+            try:
+                await asyncio.wait_for(operation, timeout=5.0)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
 
         await run(fixture.node.close(eject=True))
         await run(fixture.session_spy.real.close())
         await run(fixture.server.close())
-
         self.force_pool_remove(fixture.node)
         if fixture in self.resources:
             self.resources.remove(fixture)
-        if not suppress_errors and fixture.node.identifier in wavelink.Pool.nodes:
-            raise RuntimeError(f"fixture node leaked in Pool after close: {fixture.node.identifier}")
+
+        if first_error is None:
+            registry: dict[str, wavelink.Node] = getattr(wavelink.Pool, "_Pool__nodes")
+            if registry.get(fixture.node.identifier) is fixture.node:
+                first_error = RuntimeError(f"fixture node leaked in Pool after close: {fixture.node.identifier}")
+
+        if first_error is not None and not suppress_errors:
+            raise first_error
 
     async def make_node(
         self,
