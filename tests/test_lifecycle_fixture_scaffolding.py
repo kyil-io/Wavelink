@@ -17,6 +17,7 @@ from tests.lifecycle_fixtures import (
     make_pre_ready_close_then_handshake_failure_handler,
     make_ready_websocket_handler,
 )
+from wavelink.enums import NodeStatus
 
 
 class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
@@ -164,12 +165,10 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             race.release_first()
             await asyncio.wait_for(ready_waiter, timeout=1.0)
             self.assertEqual(rig.events.counts["wavelink_node_ready"], 1)
-            self.assertEqual(len(rig.events.payloads["wavelink_node_ready"]), 1)
             self.assertEqual(
                 rig.events.payloads["wavelink_node_ready"][0][0].node.identifier,
                 "shared-identifier",
             )
-            self.assertFalse(race.first_task.cancelled())
             self.assertFalse(race.second_task.done())
 
             race.release_second()
@@ -179,6 +178,10 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(race.second_task.done())
             self.assertFalse(getattr(race.first_task, "_log_traceback", False))
             self.assertFalse(getattr(race.second_task, "_log_traceback", False))
+            await rig.events.wait_for_count("wavelink_node_ready", 2)
+            self.assertEqual(wavelink.Pool.nodes["shared-identifier"], second.node)
+            self.assertIs(first.node.status, NodeStatus.CONNECTED)
+            self.assertIs(second.node.status, NodeStatus.CONNECTED)
 
             await rig.close_fixture(first, suppress_errors=False)
             await rig.close_fixture(second, suppress_errors=False)
@@ -210,6 +213,7 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
     async def test_lifecycle_fixture_rig_close_ejects_managed_nodes(self) -> None:
         rig = LifecycleFixtureRig()
         await rig.enter()
+        self.addAsyncCleanup(rig.close)
 
         fixture = await rig.make_node(
             identifier="managed-resource",
@@ -495,6 +499,7 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
     async def test_rig_close_surfaces_first_resource_failure_and_settles_later_resources(self) -> None:
         rig = LifecycleFixtureRig()
         await rig.enter()
+        self.addAsyncCleanup(rig.close)
 
         first_fixture = await rig.make_node(
             identifier="close-rig-first",
