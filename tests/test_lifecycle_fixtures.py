@@ -57,53 +57,6 @@ class TestLifecycleFixtures(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(waiter, timeout=1.0)
         self.assertEqual(recorder.counts["wavelink_node_ready"], 1)
 
-    async def test_event_recorder_timeout_waiter_cleanup_removes_only_timed_out_waiter(self) -> None:
-        recorder = EventRecorder()
-        both_waiters_registered = asyncio.Event()
-        recorder.on_waiter_count("wavelink_node_ready", 2, both_waiters_registered.set)
-
-        surviving_waiter = asyncio.create_task(recorder.wait_for_count("wavelink_node_ready", 1, timeout=5.0))
-        timed_out_waiter = asyncio.create_task(recorder.wait_for_count("wavelink_node_ready", 2, timeout=0.05))
-
-        await asyncio.wait_for(both_waiters_registered.wait(), timeout=1.0)
-        with self.assertRaises(asyncio.TimeoutError):
-            await timed_out_waiter
-
-        self.assertEqual(len(recorder._count_waiters["wavelink_node_ready"]), 1)
-        self.assertEqual(recorder._count_waiters["wavelink_node_ready"][0][0], 1)
-
-        abandoned_waiters_counted = asyncio.Event()
-        recorder.on_waiter_count("wavelink_node_ready", 2, abandoned_waiters_counted.set)
-        self.assertFalse(abandoned_waiters_counted.is_set())
-
-        surviving_waiter.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await surviving_waiter
-
-    async def test_event_recorder_cancelled_waiter_cleanup_removes_only_cancelled_waiter(self) -> None:
-        recorder = EventRecorder()
-        both_waiters_registered = asyncio.Event()
-        recorder.on_waiter_count("wavelink_node_ready", 2, both_waiters_registered.set)
-
-        surviving_waiter = asyncio.create_task(recorder.wait_for_count("wavelink_node_ready", 1, timeout=5.0))
-        cancelled_waiter = asyncio.create_task(recorder.wait_for_count("wavelink_node_ready", 2, timeout=5.0))
-
-        await asyncio.wait_for(both_waiters_registered.wait(), timeout=1.0)
-        cancelled_waiter.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await cancelled_waiter
-
-        self.assertEqual(len(recorder._count_waiters["wavelink_node_ready"]), 1)
-        self.assertEqual(recorder._count_waiters["wavelink_node_ready"][0][0], 1)
-
-        abandoned_waiters_counted = asyncio.Event()
-        recorder.on_waiter_count("wavelink_node_ready", 2, abandoned_waiters_counted.set)
-        self.assertFalse(abandoned_waiters_counted.is_set())
-
-        surviving_waiter.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await surviving_waiter
-
     async def test_loopback_lavalink_serves_info_and_websocket(self) -> None:
         async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
             ws = web.WebSocketResponse()

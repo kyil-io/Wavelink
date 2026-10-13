@@ -250,20 +250,15 @@ class EventRecorder:
         if self.counts[event] >= minimum_count:
             return
         waiter = asyncio.Event()
-        waiter_registration = (minimum_count, waiter)
         pending_waiters = self._count_waiters[event]
-        pending_waiters.append(waiter_registration)
+        pending_waiters.append((minimum_count, waiter))
         current_waiter_count = len(pending_waiters)
         pending_waiter_hooks = self._waiter_count_hooks[event]
         for minimum_waiters, callback in pending_waiter_hooks[:]:
             if current_waiter_count >= minimum_waiters:
                 callback()
                 pending_waiter_hooks.remove((minimum_waiters, callback))
-        try:
-            await asyncio.wait_for(waiter.wait(), timeout=timeout)
-        finally:
-            if waiter_registration in pending_waiters:
-                pending_waiters.remove(waiter_registration)
+        await asyncio.wait_for(waiter.wait(), timeout=timeout)
 
     def on_count(self, event: str, minimum_count: int, callback: Callable[[], None]) -> None:
         if self.counts[event] >= minimum_count:
