@@ -150,7 +150,10 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(rig.close_fixture, second, suppress_errors=True)
         self.addAsyncCleanup(rig.close_fixture, first, suppress_errors=True)
 
-        race = begin_same_identifier_connect_race(first=first, second=second, client=rig.client)
+        client = rig.client
+        if client is None:
+            raise RuntimeError("LifecycleFixtureRig.enter() must initialize client")
+        race = begin_same_identifier_connect_race(first=first, second=second, client=client)
         try:
             await race.wait_until_both_candidates_ready()
             self.assertFalse(race.first_task.done())

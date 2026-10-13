@@ -15,7 +15,7 @@ from aiohttp import web
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
     import wavelink
 
@@ -424,8 +424,8 @@ class CloseJoinBarrier:
 class SameIdentifierConnectRace:
     first_gate: ConnectReturnGate
     second_gate: ConnectReturnGate
-    first_task: asyncio.Task[dict[str, wavelink.Node]]
-    second_task: asyncio.Task[dict[str, wavelink.Node]]
+    first_task: asyncio.Task[object]
+    second_task: asyncio.Task[object]
 
     async def wait_until_both_candidates_ready(self, *, timeout: float = 5.0) -> None:
         await asyncio.wait_for(self.first_gate.entered.wait(), timeout=timeout)
@@ -650,7 +650,7 @@ class LifecycleFixtureRig:
         identifier: str,
         websocket_handler: Callable[[web.Request, int], Awaitable[web.StreamResponse]],
         retries: int | None = 1,
-    ) -> AsyncIterator[FixtureNode]:
+    ) -> AsyncGenerator[FixtureNode, None]:
         fixture = await self.make_node(
             identifier=identifier,
             websocket_handler=websocket_handler,
