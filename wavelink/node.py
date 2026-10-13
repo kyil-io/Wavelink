@@ -24,9 +24,11 @@ SOFTWARE.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import urllib.parse
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias
 
 import aiohttp
@@ -81,6 +83,24 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 Method = Literal["GET", "POST", "PATCH", "DELETE", "PUT", "OPTIONS"]
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedCloseOutcome:
+    close_boundary: Websocket | None
+    primary_socket: Any | None
+    primary_socket_disposed: bool
+    first_error: BaseException | None
+
+
+@dataclass(slots=True)
+class _RetainedCloseState:
+    generation: int
+    task: asyncio.Task[_RetainedCloseOutcome]
+    close_boundary: Websocket | None
+    eject_requested: bool
+    ejected: bool = False
+    owner_failure_observed: bool = False
 
 
 class Node:
@@ -166,6 +186,11 @@ class Node:
         self._spotify_enabled: bool = False
 
         self._websocket: Websocket | None = None
+        self._retained_candidate_sockets: list[Any] = []
+        self._retired_candidate_disposal_error: BaseException | None = None
+        self._close_state: _RetainedCloseState | None = None
+        self._close_state_lock: asyncio.Lock = asyncio.Lock()
+        self._connect_generation: int = 0
 
         if inactive_player_timeout and inactive_player_timeout < 10:
             logger.warning('Setting "inactive_player_timeout" below 10 seconds may result in unwanted side effects.')
@@ -300,50 +325,355 @@ class Node:
 
             Added the ``eject`` parameter. Fixed a bug where the connected Players were not being disconnected.
         """
+        close_state = await self._retain_close_state(eject=eject)
+        outcome = await asyncio.shield(close_state.task)
+        await self._maybe_eject_retained_state(close_state)
+
+        if outcome.first_error is not None:
+            raise outcome.first_error
+
+    async def _retain_close_state(self, *, eject: bool) -> _RetainedCloseState:
+        async with self._close_state_lock:
+            state = self._close_state
+            if state is None:
+                self._connect_generation += 1
+                close_boundary = self._websocket
+                generation = self._connect_generation
+                task = asyncio.create_task(
+                    self._run_retained_close_owner(generation=generation, close_boundary=close_boundary)
+                )
+                state = _RetainedCloseState(
+                    generation=generation,
+                    task=task,
+                    close_boundary=close_boundary,
+                    eject_requested=eject,
+                )
+                task.add_done_callback(lambda task_: self._observe_retained_close_owner_result(state=state, task=task_))
+                self._close_state = state
+            else:
+                state.eject_requested = state.eject_requested or eject
+            return state
+
+    def _observe_retained_close_owner_result(
+        self, *, state: _RetainedCloseState, task: asyncio.Task[_RetainedCloseOutcome]
+    ) -> None:
+        try:
+            outcome = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            if state.owner_failure_observed:
+                return
+            state.owner_failure_observed = True
+            logger.exception("Unexpected retained close owner task failure for %r", self)
+            return
+
+        failure = outcome.first_error
+        if failure is None or state.owner_failure_observed:
+            return
+
+        state.owner_failure_observed = True
+        logger.error(
+            "Retained close owner failed for %r",
+            self,
+            exc_info=(type(failure), failure, failure.__traceback__),
+        )
+
+    async def _run_retained_close_owner(
+        self, *, generation: int, close_boundary: Websocket | None
+    ) -> _RetainedCloseOutcome:
+        first_error: BaseException | None = None
+        closed_dispatch_error: BaseException | None = None
         disconnected: list[Player] = []
+        primary_socket: Any | None = None
+        primary_socket_disposed = True
 
         for player in self._players.copy().values():
             try:
                 await player.disconnect()
-            except Exception as e:
-                logger.debug("An error occured while disconnecting a player in the close method of %r: %s", self, e)
-                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("An error occured while disconnecting a player in the close method of %r: %s", self, exc)
+                if first_error is None:
+                    first_error = exc
 
             disconnected.append(player)
 
-        if self._websocket is not None:
-            await self._websocket.cleanup()
+        if close_boundary is not None:
+            try:
+                await close_boundary.cleanup()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
 
-        self._status = NodeStatus.DISCONNECTED
-        self._session_id = None
-        self._players = {}
+            cleanup_task = close_boundary._cleanup_task
+            if cleanup_task is not None and cleanup_task.done():
+                try:
+                    cleanup_outcome = cleanup_task.result()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                else:
+                    primary_socket = cleanup_outcome.primary_socket
+                    primary_socket_disposed = cleanup_outcome.primary_socket_disposed
+                    if first_error is None and cleanup_outcome.first_error is not None:
+                        first_error = cleanup_outcome.first_error
+        else:
+            self._status = NodeStatus.DISCONNECTED
+            self._session_id = None
+            self._players = {}
+            self._websocket = None
 
         self._has_closed = True
 
-        if eject:
-            nodes = getattr(Pool, "_Pool__nodes")
-            if nodes.get(self.identifier) is self:
-                nodes.pop(self.identifier, None)
+        await self._maybe_eject_retained_state(self._close_state, allow_owner_before_done=True)
 
         # Dispatch Node Closed Event... node, list of disconnected players
         if self.client is not None:
-            self.client.dispatch("wavelink_node_closed", self, disconnected)
+            try:
+                self.client.dispatch("wavelink_node_closed", self, disconnected)
+            except BaseException as exc:
+                closed_dispatch_error = exc
 
-    async def _connect(self, *, client: discord.Client | None) -> None:
+        if first_error is None:
+            first_error = closed_dispatch_error
+        elif closed_dispatch_error is not None:
+            self._append_error_chain(first_error, closed_dispatch_error)
+
+        return _RetainedCloseOutcome(
+            close_boundary=close_boundary,
+            primary_socket=primary_socket,
+            primary_socket_disposed=primary_socket_disposed,
+            first_error=first_error,
+        )
+
+    async def _maybe_eject_retained_state(
+        self, state: _RetainedCloseState | None, *, allow_owner_before_done: bool = False
+    ) -> None:
+        if state is None:
+            return
+
+        async with self._close_state_lock:
+            current_state = self._close_state
+            if current_state is not state:
+                return
+
+            owner_incomplete = allow_owner_before_done and asyncio.current_task() is current_state.task
+            if not current_state.task.done() and not owner_incomplete:
+                return
+
+            if not current_state.eject_requested or current_state.ejected:
+                return
+
+            nodes = getattr(Pool, "_Pool__nodes")
+            if nodes.get(self.identifier) is self:
+                nodes.pop(self.identifier, None)
+            current_state.ejected = True
+
+    async def _reserve_connect_generation(self) -> int:
+        async with self._close_state_lock:
+            self._connect_generation += 1
+            return self._connect_generation
+
+    def _retain_failed_candidate_socket(self, socket: Any) -> None:
+        if socket.closed:
+            return
+        if socket in self._retained_candidate_sockets:
+            return
+        self._retained_candidate_sockets.append(socket)
+
+    def _release_closed_retained_candidate_sockets(self) -> None:
+        if not self._retained_candidate_sockets:
+            return
+        self._retained_candidate_sockets = [socket for socket in self._retained_candidate_sockets if not socket.closed]
+
+    def _has_unresolved_retained_candidate_sockets(self) -> bool:
+        self._release_closed_retained_candidate_sockets()
+        return any(not socket.closed for socket in self._retained_candidate_sockets)
+
+    def _is_current_pool_member(self) -> bool:
+        return getattr(Pool, "_Pool__nodes").get(self.identifier) is self
+
+    async def _is_connect_generation_invalid(self, *, generation: int) -> bool:
+        async with self._close_state_lock:
+            obsolete = generation != self._connect_generation
+            return obsolete
+
+    async def _join_and_claim_retained_close_state(self, *, generation: int) -> None:
+        state: _RetainedCloseState | None
+        async with self._close_state_lock:
+            state = self._close_state
+
+        if state is None:
+            return
+
+        await asyncio.shield(state.task)
+
+        async with self._close_state_lock:
+            current_state = self._close_state
+            if current_state is not state:
+                return
+
+            if generation != self._connect_generation:
+                raise NodeException(f"Unable to connect {self!r} due to obsolete generation or closed lifecycle state.")
+
+            outcome = state.task.result()
+            if outcome.first_error is not None and not outcome.primary_socket_disposed:
+                raise outcome.first_error
+
+            if not outcome.primary_socket_disposed:
+                raise NodeException(
+                    f"Unable to connect {self!r} while a previously retained websocket candidate remains unresolved."
+                )
+
+            if self._has_unresolved_retained_candidate_sockets():
+                raise NodeException(
+                    f"Unable to connect {self!r} while a previously retained websocket candidate remains unresolved."
+                )
+
+            if state.close_boundary is not outcome.close_boundary:
+                raise NodeException(f"Unable to connect {self!r} due to retained close boundary mismatch.")
+
+            self._close_state = None
+
+    async def _connect(
+        self, *, client: discord.Client | None, generation: int | None = None, require_pool_membership: bool = False
+    ) -> None:
         client_ = self._client or client
 
         if not client_:
             raise InvalidClientException(f"Unable to connect {self!r} as you have not provided a valid discord.Client.")
 
-        self._client = client_
+        if require_pool_membership and not self._is_current_pool_member():
+            return
 
+        if generation is None:
+            generation = await self._reserve_connect_generation()
+
+        await self._join_and_claim_retained_close_state(generation=generation)
+
+        if require_pool_membership and not self._is_current_pool_member():
+            return
+
+        if await self._is_connect_generation_invalid(generation=generation):
+            raise NodeException(f"Unable to connect {self!r} due to obsolete generation or closed lifecycle state.")
+
+        if self._has_unresolved_retained_candidate_sockets():
+            raise RuntimeError(
+                f"Unable to connect {self!r} while a previously retained websocket candidate remains unresolved."
+            )
+
+        if require_pool_membership and not self._is_current_pool_member():
+            return
+
+        self._client = client_
         self._has_closed = False
         if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession()
 
         websocket: Websocket = Websocket(node=self)
         self._websocket = websocket
+        self._retired_candidate_disposal_error = None
         await websocket.connect()
+
+        if await self._is_connect_generation_invalid(generation=generation):
+            try:
+                await self._retire_obsolete_connect_candidate(websocket=websocket)
+            except BaseException as exc:
+                self._retired_candidate_disposal_error = exc
+                raise
+            raise NodeException(f"Unable to connect {self!r} due to obsolete generation or closed lifecycle state.")
+
+    async def _retire_obsolete_connect_candidate(self, *, websocket: Websocket) -> None:
+        current_task = asyncio.current_task()
+        owned_tasks: list[asyncio.Task[Any]] = []
+        first_error: BaseException | None = None
+
+        for task in (websocket.keep_alive_task, websocket.reconnect_task):
+            if task is None or task is current_task:
+                continue
+            task.cancel()
+            owned_tasks.append(task)
+
+        socket = websocket.socket
+        if socket is not None and not socket.closed:
+            try:
+                await socket.close()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                self._retain_failed_candidate_socket(socket)
+                if first_error is None:
+                    first_error = exc
+
+        for task in (websocket.keep_alive_task, websocket.reconnect_task):
+            if task is None or task is current_task or task in owned_tasks:
+                continue
+            task.cancel()
+            owned_tasks.append(task)
+
+        for task in owned_tasks:
+            if task.done():
+                continue
+            try:
+                await task
+            except asyncio.CancelledError:
+                continue
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if self._websocket is websocket:
+            self._status = NodeStatus.DISCONNECTED
+            self._session_id = None
+            self._players = {}
+            self._websocket = None
+
+        if first_error is not None:
+            raise first_error
+
+    @staticmethod
+    def _append_error_chain(first_error: BaseException, appended_error: BaseException) -> None:
+        if first_error is appended_error:
+            return
+
+        visited: set[int] = set()
+        primary_chain_ids: set[int] = set()
+        current: BaseException = first_error
+
+        while True:
+            current_id = id(current)
+            if current_id in visited:
+                return
+
+            visited.add(current_id)
+            primary_chain_ids.add(current_id)
+            cause = current.__cause__
+
+            if cause is None:
+                appended_visited: set[int] = set()
+                appended_current: BaseException | None = appended_error
+                while appended_current is not None:
+                    appended_id = id(appended_current)
+                    if appended_id in primary_chain_ids:
+                        return
+                    if appended_id in appended_visited:
+                        break
+                    appended_visited.add(appended_id)
+                    appended_current = appended_current.__cause__
+
+                current.__cause__ = appended_error
+                return
+
+            if cause is appended_error:
+                return
+
+            current = cause
 
     async def send(
         self, method: Method = "GET", *, path: str, data: Any | None = None, params: dict[str, Any] | None = None
@@ -750,6 +1080,27 @@ class Pool:
     __nodes: ClassVar[dict[str, Node]] = {}
     __cache: LFUCache | None = None
 
+    @staticmethod
+    def _is_retained_pre_disposal_failure(node: Node, exc: BaseException) -> bool:
+        state = node._close_state
+        if state is None or not state.task.done():
+            return False
+
+        try:
+            outcome = state.task.result()
+        except BaseException:
+            return False
+
+        return outcome.first_error is exc and not outcome.primary_socket_disposed
+
+    @staticmethod
+    def _consume_retired_candidate_disposal_failure(node: Node, exc: BaseException) -> bool:
+        retained = node._retired_candidate_disposal_error
+        if retained is not exc:
+            return False
+        node._retired_candidate_disposal_error = None
+        return True
+
     @classmethod
     async def connect(
         cls, *, nodes: Iterable[Node], client: discord.Client | None = None, cache_capacity: int | None = None
@@ -801,13 +1152,28 @@ class Pool:
                 logger.error("Unable to connect %r as it is already in a connecting or connected state.", node)
                 continue
 
+            generation = await node._reserve_connect_generation()
+            if await node._is_connect_generation_invalid(generation=generation):
+                logger.error(
+                    "Unable to connect %r as its lifecycle state is terminal for generation %s.", node, generation
+                )
+                continue
+
             try:
-                await node._connect(client=client_)
+                await node._connect(client=client_, generation=generation)
             except InvalidClientException as e:
                 logger.error(e)
-            except AuthorizationFailedException:
+            except AuthorizationFailedException as e:
+                if cls._consume_retired_candidate_disposal_failure(node, e):
+                    raise
+                if cls._is_retained_pre_disposal_failure(node, e):
+                    raise
                 logger.error("Failed to authenticate %r on Lavalink with the provided password.", node)
-            except NodeException:
+            except NodeException as e:
+                if cls._consume_retired_candidate_disposal_failure(node, e):
+                    raise
+                if cls._is_retained_pre_disposal_failure(node, e):
+                    raise
                 logger.error(
                     (
                         "Failed to connect to %r. Check that your Lavalink major version is"
@@ -816,6 +1182,19 @@ class Pool:
                     node,
                 )
             else:
+                existing = cls.__nodes.get(node.identifier)
+                if existing is not None and existing is not node:
+                    logger.error(
+                        "Unable to register %r because another node instance with identifier %r is active.",
+                        node,
+                        node.identifier,
+                    )
+                    continue
+
+                if await node._is_connect_generation_invalid(generation=generation):
+                    logger.error("Unable to register %r due to obsolete generation %s.", node, generation)
+                    continue
+
                 cls.__nodes[node.identifier] = node
 
         if cache_capacity is not None and cls.nodes:
@@ -830,17 +1209,25 @@ class Pool:
 
     @classmethod
     async def reconnect(cls) -> dict[str, Node]:
-        for node in cls.__nodes.values():
+        for node in tuple(cls.__nodes.values()):
             if node.status is not NodeStatus.DISCONNECTED:
                 continue
 
             try:
-                await node._connect(client=None)
+                await node._connect(client=None, require_pool_membership=True)
             except InvalidClientException as e:
                 logger.error(e)
-            except AuthorizationFailedException:
+            except AuthorizationFailedException as e:
+                if cls._consume_retired_candidate_disposal_failure(node, e):
+                    raise
+                if cls._is_retained_pre_disposal_failure(node, e):
+                    raise
                 logger.error("Failed to authenticate %r on Lavalink with the provided password.", node)
-            except NodeException:
+            except NodeException as e:
+                if cls._consume_retired_candidate_disposal_failure(node, e):
+                    raise
+                if cls._is_retained_pre_disposal_failure(node, e):
+                    raise
                 logger.error(
                     (
                         "Failed to connect to %r. Check that your Lavalink major version "
@@ -860,8 +1247,22 @@ class Pool:
 
         .. versionadded:: 3.0.0
         """
-        for node in cls.__nodes.values():
-            await node.close()
+        nodes_snapshot = tuple(cls.__nodes.values())
+        first_error: Exception | None = None
+
+        for node in nodes_snapshot:
+            try:
+                await node.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    Node._append_error_chain(first_error, exc)
+
+        if first_error is not None:
+            raise first_error
 
     @classproperty
     def nodes(cls) -> dict[str, Node]:
