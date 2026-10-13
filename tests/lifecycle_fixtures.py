@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 import weakref
 from collections import defaultdict
@@ -13,7 +14,7 @@ from aiohttp import web
 
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
     import wavelink
 
@@ -217,6 +218,60 @@ class ScriptedCloseSocket:
         return getattr(self._websocket, name)
 
 
+def build_ready_payload(session_id: str, *, resumed: bool = False) -> dict[str, Any]:
+    return {"op": "ready", "resumed": resumed, "sessionId": session_id}
+
+
+def build_player_update_payload(
+    guild_id: str, *, time: int = 0, position: int = 0, ping: int = 0
+) -> dict[str, Any]:
+    return {"op": "playerUpdate", "guildId": guild_id, "state": {"time": time, "position": position, "ping": ping}}
+
+
+async def close_when_client_finishes(websocket: web.WebSocketResponse) -> web.WebSocketResponse:
+    while not websocket.closed:
+        message = await websocket.receive()
+        if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+            break
+    await websocket.close()
+    return websocket
+
+
+def make_ready_websocket_handler(
+    session_id: str, *, include_connection_number: bool = False, extra_payloads: Sequence[dict[str, Any]] = ()
+) -> Callable[[web.Request, int], Awaitable[web.StreamResponse]]:
+    async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        ready_session_id = f"{session_id}-{number}" if include_connection_number else session_id
+        await websocket.send_json(build_ready_payload(ready_session_id))
+        for payload in extra_payloads:
+            await websocket.send_json(payload)
+        return await close_when_client_finishes(websocket)
+
+    return websocket_handler
+
+
+def make_pre_ready_close_then_handshake_failure_handler(
+    *,
+    handshake_status: int,
+    reconnect_attempted: asyncio.Event | None = None,
+    send_invalid_json_before_close: bool = False,
+) -> Callable[[web.Request, int], Awaitable[web.StreamResponse]]:
+    async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
+        if number == 1:
+            websocket = web.WebSocketResponse()
+            await websocket.prepare(request)
+            if send_invalid_json_before_close:
+                await websocket.send_str("{")
+            return await close_when_client_finishes(websocket)
+        if reconnect_attempted is not None:
+            reconnect_attempted.set()
+        return web.Response(status=handshake_status)
+
+    return websocket_handler
+
+
 class EventRecorder:
     def __init__(self) -> None:
         self.counts: defaultdict[str, int] = defaultdict(int)
@@ -334,6 +389,57 @@ class CloseJoinBarrier:
         node.close = close_with_join_boundary  # type: ignore[method-assign]
 
 
+@dataclass
+class SameIdentifierConnectRace:
+    first_gate: ConnectReturnGate
+    second_gate: ConnectReturnGate
+    first_task: asyncio.Task[None]
+    second_task: asyncio.Task[None]
+
+    async def wait_until_both_candidates_ready(self, *, timeout: float = 5.0) -> None:
+        await asyncio.wait_for(self.first_gate.entered.wait(), timeout=timeout)
+        await asyncio.wait_for(self.second_gate.entered.wait(), timeout=timeout)
+
+    def release_first(self) -> None:
+        self.first_gate.release()
+
+    def release_second(self) -> None:
+        self.second_gate.release()
+
+    async def settle(self, *, timeout: float = 5.0) -> None:
+        await asyncio.wait_for(self.first_task, timeout=timeout)
+        await asyncio.wait_for(self.second_task, timeout=timeout)
+
+    async def cancel_and_drain(self, *, timeout: float = 5.0) -> None:
+        self.first_gate.release()
+        self.second_gate.release()
+        for task in (self.first_task, self.second_task):
+            if task.done():
+                continue
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=timeout)
+
+
+def begin_same_identifier_connect_race(
+    *, first: FixtureNode, second: FixtureNode, client: discord.Client
+) -> SameIdentifierConnectRace:
+    import wavelink
+
+    first_gate = ConnectReturnGate()
+    second_gate = ConnectReturnGate()
+    first.session_spy.connect_return_gate = first_gate
+    second.session_spy.connect_return_gate = second_gate
+    first_task = asyncio.create_task(wavelink.Pool.connect(nodes=[first.node], client=client))
+    second_task = asyncio.create_task(wavelink.Pool.connect(nodes=[second.node], client=client))
+    return SameIdentifierConnectRace(
+        first_gate=first_gate,
+        second_gate=second_gate,
+        first_task=first_task,
+        second_task=second_task,
+    )
+
+
 class LoopbackLavalink:
     def __init__(self, websocket_handler: Callable[[web.Request, int], Awaitable[web.StreamResponse]]) -> None:
         self._websocket_handler = websocket_handler
@@ -380,3 +486,117 @@ class FixtureNode:
     server: LoopbackLavalink
     session_spy: SessionSpy
     node: wavelink.Node
+
+
+class LifecycleFixtureRig:
+    def __init__(self) -> None:
+        self.client: discord.Client | None = None
+        self.events = EventRecorder()
+        self.resources: list[FixtureNode] = []
+        self._entered = False
+
+    async def enter(self) -> None:
+        import wavelink
+
+        if wavelink.Pool.nodes:
+            node_identifiers = tuple(wavelink.Pool.nodes)
+            raise RuntimeError(
+                f"Pool.nodes must be empty before lifecycle rig setup, found {node_identifiers}"
+            )
+
+        self.client = discord.Client(intents=discord.Intents.none())
+        install_offline_client_user(self.client)
+        await self.client.__aenter__()
+        self.events.attach(self.client)
+        self._entered = True
+
+    async def close(self) -> None:
+        if not self._entered:
+            return
+
+        for resource in reversed(self.resources):
+            await self.close_fixture(resource, suppress_errors=True)
+        self.resources.clear()
+
+        if self.client is not None:
+            await asyncio.wait_for(self.client.__aexit__(None, None, None), timeout=5.0)
+            self.client = None
+        self._entered = False
+
+    async def close_fixture(self, fixture: FixtureNode, *, suppress_errors: bool = False) -> None:
+        import wavelink
+
+        async def run(operation: Awaitable[Any]) -> None:
+            if suppress_errors:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(operation, timeout=5.0)
+                return
+            await asyncio.wait_for(operation, timeout=5.0)
+
+        await run(fixture.node.close(eject=True))
+        await run(fixture.session_spy.real.close())
+        await run(fixture.server.close())
+
+        self.force_pool_remove(fixture.node)
+        if fixture in self.resources:
+            self.resources.remove(fixture)
+        if not suppress_errors and fixture.node.identifier in wavelink.Pool.nodes:
+            raise RuntimeError(f"fixture node leaked in Pool after close: {fixture.node.identifier}")
+
+    async def make_node(
+        self,
+        *,
+        identifier: str,
+        websocket_handler: Callable[[web.Request, int], Awaitable[web.StreamResponse]],
+        retries: int | None = 1,
+        managed: bool = True,
+    ) -> FixtureNode:
+        import wavelink
+
+        if self.client is None:
+            raise RuntimeError("LifecycleFixtureRig.enter() must be called before creating nodes")
+
+        server = LoopbackLavalink(websocket_handler)
+        await server.start()
+        session_spy = SessionSpy(aiohttp.ClientSession())
+        node = wavelink.Node(
+            identifier=identifier,
+            uri=server.uri,
+            password="placeholder",
+            session=cast("aiohttp.ClientSession", session_spy),
+            heartbeat=30.0,
+            retries=retries,
+            client=self.client,
+            resume_timeout=0,
+        )
+        fixture = FixtureNode(server=server, session_spy=session_spy, node=node)
+        if managed:
+            self.resources.append(fixture)
+        return fixture
+
+    @contextlib.asynccontextmanager
+    async def unmanaged_node(
+        self,
+        *,
+        identifier: str,
+        websocket_handler: Callable[[web.Request, int], Awaitable[web.StreamResponse]],
+        retries: int | None = 1,
+    ) -> AsyncIterator[FixtureNode]:
+        fixture = await self.make_node(
+            identifier=identifier,
+            websocket_handler=websocket_handler,
+            retries=retries,
+            managed=False,
+        )
+        try:
+            yield fixture
+        finally:
+            await self.close_fixture(fixture, suppress_errors=True)
+
+    @staticmethod
+    def force_pool_remove(node: wavelink.Node) -> None:
+        import wavelink
+
+        registry: dict[str, wavelink.Node] = getattr(wavelink.Pool, "_Pool__nodes")
+        if registry.get(node.identifier) is node:
+            registry.pop(node.identifier, None)
