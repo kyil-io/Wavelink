@@ -321,7 +321,9 @@ class Node:
         self._has_closed = True
 
         if eject:
-            getattr(Pool, "_Pool__nodes").pop(self.identifier, None)
+            nodes = getattr(Pool, "_Pool__nodes")
+            if nodes.get(self.identifier) is self:
+                nodes.pop(self.identifier, None)
 
         # Dispatch Node Closed Event... node, list of disconnected players
         if self.client is not None:
