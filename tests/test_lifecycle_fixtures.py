@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -45,7 +46,12 @@ class TestLifecycleFixtures(unittest.IsolatedAsyncioTestCase):
 
         recorder = EventRecorder()
         recorder.attach(client)
+        waiter_registered = asyncio.Event()
+        recorder.on_waiter_count("wavelink_node_ready", 1, waiter_registered.set)
         waiter = asyncio.create_task(recorder.wait_for_count("wavelink_node_ready", 1))
+
+        await asyncio.wait_for(waiter_registered.wait(), timeout=1.0)
+        self.assertFalse(waiter.done())
 
         client.dispatch("wavelink_node_ready")
         await asyncio.wait_for(waiter, timeout=1.0)
@@ -72,6 +78,15 @@ class TestLifecycleFixtures(unittest.IsolatedAsyncioTestCase):
             async with session.ws_connect(f"{server.uri}/v4/websocket") as websocket:
                 message = await websocket.receive_json()
                 self.assertEqual(message["op"], "ready")
+
+        parsed_uri = urlparse(server.uri)
+        self.assertIsNotNone(parsed_uri.hostname)
+        self.assertIsNotNone(parsed_uri.port)
+        await server.close()
+        with self.assertRaises(OSError):
+            _, writer = await asyncio.open_connection(parsed_uri.hostname or "", parsed_uri.port or 0)
+            writer.close()
+            await writer.wait_closed()
 
         self.assertEqual(server.info_count, 1)
         self.assertEqual(server.request_count, 1)
@@ -103,3 +118,6 @@ class TestLifecycleFixtures(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(session_spy.post_boundary_call.wait(), timeout=1.0)
         self.assertEqual(session_spy.ws_connect_calls, 2)
         self.assertEqual(session_spy.call_events, [(1, False), (2, False)])
+
+        await session_spy.real.close()
+        self.assertTrue(session_spy.closed)

@@ -223,6 +223,7 @@ class EventRecorder:
         self.payloads: defaultdict[str, list[tuple[Any, ...]]] = defaultdict(list)
         self._count_waiters: defaultdict[str, list[tuple[int, asyncio.Event]]] = defaultdict(list)
         self._count_hooks: defaultdict[str, list[tuple[int, Callable[[], None]]]] = defaultdict(list)
+        self._waiter_count_hooks: defaultdict[str, list[tuple[int, Callable[[], None]]]] = defaultdict(list)
 
     def attach(self, client: discord.Client) -> None:
         original_dispatch = client.dispatch
@@ -249,7 +250,14 @@ class EventRecorder:
         if self.counts[event] >= minimum_count:
             return
         waiter = asyncio.Event()
-        self._count_waiters[event].append((minimum_count, waiter))
+        pending_waiters = self._count_waiters[event]
+        pending_waiters.append((minimum_count, waiter))
+        current_waiter_count = len(pending_waiters)
+        pending_waiter_hooks = self._waiter_count_hooks[event]
+        for minimum_waiters, callback in pending_waiter_hooks[:]:
+            if current_waiter_count >= minimum_waiters:
+                callback()
+                pending_waiter_hooks.remove((minimum_waiters, callback))
         await asyncio.wait_for(waiter.wait(), timeout=timeout)
 
     def on_count(self, event: str, minimum_count: int, callback: Callable[[], None]) -> None:
@@ -257,6 +265,12 @@ class EventRecorder:
             callback()
             return
         self._count_hooks[event].append((minimum_count, callback))
+
+    def on_waiter_count(self, event: str, minimum_waiters: int, callback: Callable[[], None]) -> None:
+        if len(self._count_waiters[event]) >= minimum_waiters:
+            callback()
+            return
+        self._waiter_count_hooks[event].append((minimum_waiters, callback))
 
 
 class ReceiveCancelGate:
