@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import socket
 import weakref
 from collections import defaultdict
@@ -237,6 +238,14 @@ async def close_when_client_finishes(websocket: web.WebSocketResponse) -> web.We
     return websocket
 
 
+async def wait_for_client_close(websocket: web.WebSocketResponse) -> web.WebSocketResponse:
+    while not websocket.closed:
+        message = await websocket.receive()
+        if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+            break
+    return websocket
+
+
 def make_ready_websocket_handler(
     session_id: str, *, include_connection_number: bool = False, extra_payloads: Sequence[dict[str, Any]] = ()
 ) -> Callable[[web.Request, int], Awaitable[web.StreamResponse]]:
@@ -247,7 +256,7 @@ def make_ready_websocket_handler(
         await websocket.send_json(build_ready_payload(ready_session_id))
         for payload in extra_payloads:
             await websocket.send_json(payload)
-        return await close_when_client_finishes(websocket)
+        return await wait_for_client_close(websocket)
 
     return websocket_handler
 
@@ -257,6 +266,7 @@ def make_pre_ready_close_then_handshake_failure_handler(
     handshake_status: int,
     reconnect_attempted: asyncio.Event | None = None,
     send_invalid_json_before_close: bool = False,
+    wait_for_client_close: bool = False,
 ) -> Callable[[web.Request, int], Awaitable[web.StreamResponse]]:
     async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
         if number == 1:
@@ -264,7 +274,10 @@ def make_pre_ready_close_then_handshake_failure_handler(
             await websocket.prepare(request)
             if send_invalid_json_before_close:
                 await websocket.send_str("{")
-            return await close_when_client_finishes(websocket)
+            if wait_for_client_close:
+                return await close_when_client_finishes(websocket)
+            await websocket.close()
+            return websocket
         if reconnect_attempted is not None:
             reconnect_attempted.set()
         return web.Response(status=handshake_status)
@@ -444,7 +457,10 @@ def begin_same_identifier_connect_race(
 
 
 class LoopbackLavalink:
-    def __init__(self, websocket_handler: Callable[[web.Request, int], Awaitable[web.StreamResponse]]) -> None:
+    def __init__(
+        self,
+        websocket_handler: Callable[[web.Request, int], web.StreamResponse | Awaitable[web.StreamResponse]],
+    ) -> None:
         self._websocket_handler = websocket_handler
         self.request_count = 0
         self.info_count = 0
@@ -454,7 +470,10 @@ class LoopbackLavalink:
 
     async def websocket(self, request: web.Request) -> web.StreamResponse:
         self.request_count += 1
-        return await self._websocket_handler(request, self.request_count)
+        response = self._websocket_handler(request, self.request_count)
+        if inspect.isawaitable(response):
+            return await response
+        return response
 
     async def info(self, request: web.Request) -> web.Response:
         self.info_count += 1

@@ -73,7 +73,11 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
 
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(f"{fixture.server.uri}/v4/websocket") as websocket:
-                await websocket.close()
+                close_message = await websocket.receive()
+                self.assertIn(
+                    close_message.type,
+                    (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING),
+                )
 
             with self.assertRaises(aiohttp.WSServerHandshakeError) as raised:
                 await session.ws_connect(f"{fixture.server.uri}/v4/websocket")
