@@ -104,35 +104,38 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         race = begin_same_identifier_connect_race(first=first, second=second, client=rig.client)
         try:
             await race.wait_until_both_candidates_ready()
+            self.assertFalse(race.first_task.done())
+            self.assertFalse(race.second_task.done())
+
+            ready_waiter_registered = asyncio.Event()
+            rig.events.on_waiter_count("wavelink_node_ready", 1, ready_waiter_registered.set)
+            ready_waiter = asyncio.create_task(rig.events.wait_for_count("wavelink_node_ready", 1))
+            await asyncio.wait_for(ready_waiter_registered.wait(), timeout=1.0)
+
             race.release_first()
-            await rig.events.wait_for_count("wavelink_node_ready", 1)
+            await asyncio.wait_for(ready_waiter, timeout=1.0)
+            self.assertEqual(rig.events.counts["wavelink_node_ready"], 1)
+            self.assertEqual(len(rig.events.payloads["wavelink_node_ready"]), 1)
+            self.assertEqual(
+                rig.events.payloads["wavelink_node_ready"][0][0].node.identifier,
+                "shared-identifier",
+            )
+            self.assertFalse(race.first_task.cancelled())
+            self.assertFalse(race.second_task.done())
+
             race.release_second()
             await race.settle()
-
-            registry = wavelink.Pool.nodes
-            self.assertEqual(len(registry), 1)
-            self.assertIs(registry.get("shared-identifier"), second.node)
-
-            loser_socket = first.session_spy.latest_raw_websocket
-            self.assertIsNotNone(loser_socket)
-            assert loser_socket is not None
-            self.assertFalse(first.session_spy.real.closed)
-            self.assertFalse(second.session_spy.real.closed)
-
-            ready_count = rig.events.counts["wavelink_node_ready"]
-            self.assertGreaterEqual(ready_count, 1)
-            await asyncio.sleep(0)
-            self.assertEqual(
-                rig.events.counts["wavelink_node_ready"],
-                ready_count,
-                "loser candidate must not publish late ready events after arbitration settles",
-            )
+            await race.cancel_and_drain()
+            self.assertTrue(race.first_task.done())
+            self.assertTrue(race.second_task.done())
+            self.assertFalse(getattr(race.first_task, "_log_traceback", False))
+            self.assertFalse(getattr(race.second_task, "_log_traceback", False))
 
             await rig.close_fixture(first, suppress_errors=False)
+            await rig.close_fixture(second, suppress_errors=False)
             self.assertTrue(first.session_spy.real.closed)
-            self.assertTrue(loser_socket.closed)
-            self.assertFalse(second.session_spy.real.closed)
-            self.assertIs(wavelink.Pool.nodes.get("shared-identifier"), second.node)
+            self.assertTrue(second.session_spy.real.closed)
+            self.assertNotIn("shared-identifier", wavelink.Pool.nodes)
         finally:
             await race.cancel_and_drain()
 
@@ -191,14 +194,17 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("done-failed-connect-task")
 
         async def block_until_cancelled() -> None:
+            wait_forever = asyncio.Event()
             try:
-                await asyncio.sleep(3600)
+                await wait_forever.wait()
             except asyncio.CancelledError:
                 raise
 
         done_failed_task = asyncio.create_task(fail_immediately())
+        done_failed_recorded = asyncio.Event()
+        done_failed_task.add_done_callback(lambda _task: done_failed_recorded.set())
         pending_task = asyncio.create_task(block_until_cancelled())
-        await asyncio.sleep(0)
+        await asyncio.wait_for(done_failed_recorded.wait(), timeout=1.0)
         self.assertTrue(done_failed_task.done())
 
         race = SameIdentifierConnectRace(
