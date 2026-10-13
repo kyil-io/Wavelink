@@ -424,8 +424,8 @@ class CloseJoinBarrier:
 class SameIdentifierConnectRace:
     first_gate: ConnectReturnGate
     second_gate: ConnectReturnGate
-    first_task: asyncio.Task[None]
-    second_task: asyncio.Task[None]
+    first_task: asyncio.Task[dict[str, wavelink.Node]]
+    second_task: asyncio.Task[dict[str, wavelink.Node]]
 
     async def wait_until_both_candidates_ready(self, *, timeout: float = 5.0) -> None:
         await asyncio.wait_for(self.first_gate.entered.wait(), timeout=timeout)
@@ -537,6 +537,9 @@ class LifecycleFixtureRig:
 
     async def enter(self) -> None:
         import wavelink
+
+        if self._entered:
+            raise RuntimeError("LifecycleFixtureRig.enter() cannot be called while already entered")
 
         if wavelink.Pool.nodes:
             node_identifiers = tuple(wavelink.Pool.nodes)
