@@ -527,12 +527,12 @@ class Node:
                 raise outcome.first_error
 
             if not outcome.primary_socket_disposed:
-                raise NodeException(
+                raise RuntimeError(
                     f"Unable to connect {self!r} while a previously retained websocket candidate remains unresolved."
                 )
 
             if self._has_unresolved_retained_candidate_sockets():
-                raise NodeException(
+                raise RuntimeError(
                     f"Unable to connect {self!r} while a previously retained websocket candidate remains unresolved."
                 )
 
@@ -605,11 +605,15 @@ class Node:
             try:
                 await socket.close()
             except asyncio.CancelledError:
+                self._retain_failed_candidate_socket(socket)
                 raise
             except BaseException as exc:
                 self._retain_failed_candidate_socket(socket)
                 if first_error is None:
                     first_error = exc
+            else:
+                if not socket.closed:
+                    self._retain_failed_candidate_socket(socket)
 
         for task in (websocket.keep_alive_task, websocket.reconnect_task):
             if task is None or task is current_task or task in owned_tasks:
@@ -1189,10 +1193,24 @@ class Pool:
                         node,
                         node.identifier,
                     )
+                    websocket = node._websocket
+                    if websocket is not None:
+                        try:
+                            await node._retire_obsolete_connect_candidate(websocket=websocket)
+                        except BaseException as exc:
+                            node._retired_candidate_disposal_error = exc
+                            raise
                     continue
 
                 if await node._is_connect_generation_invalid(generation=generation):
                     logger.error("Unable to register %r due to obsolete generation %s.", node, generation)
+                    websocket = node._websocket
+                    if websocket is not None:
+                        try:
+                            await node._retire_obsolete_connect_candidate(websocket=websocket)
+                        except BaseException as exc:
+                            node._retired_candidate_disposal_error = exc
+                            raise
                     continue
 
                 cls.__nodes[node.identifier] = node
