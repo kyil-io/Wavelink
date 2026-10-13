@@ -362,6 +362,136 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(fixture, rig.resources)
         self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
 
+    async def test_close_fixture_can_suppress_node_close_error_only(self) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        fixture = await rig.make_node(
+            identifier="close-fixture-suppress-node-only",
+            websocket_handler=make_ready_websocket_handler("close-fixture-suppress-node-only"),
+            managed=True,
+        )
+
+        call_order: list[str] = []
+        original_session_close = fixture.session_spy.real.close
+        original_server_close = fixture.server.close
+
+        async def close_node_fail(*_args: object, **_kwargs: object) -> None:
+            call_order.append("node")
+            raise RuntimeError("node-close-error")
+
+        async def close_session_success() -> None:
+            call_order.append("session")
+            await original_session_close()
+
+        async def close_server_success() -> None:
+            call_order.append("server")
+            await original_server_close()
+
+        fixture.node.close = close_node_fail  # type: ignore[method-assign]
+        fixture.session_spy.real.close = close_session_success  # type: ignore[method-assign]
+        fixture.server.close = close_server_success  # type: ignore[method-assign]
+
+        await rig.close_fixture(
+            fixture,
+            suppress_errors=False,
+            suppress_node_close_error=True,
+        )
+
+        self.assertEqual(call_order, ["node", "session", "server"])
+        self.assertTrue(fixture.session_spy.real.closed)
+        self.assertNotIn(fixture, rig.resources)
+        self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
+
+    async def test_close_fixture_suppressed_node_error_reraises_session_failure_and_settles_server(self) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        fixture = await rig.make_node(
+            identifier="close-fixture-session-failure-visible",
+            websocket_handler=make_ready_websocket_handler("close-fixture-session-failure-visible"),
+            managed=True,
+        )
+
+        call_order: list[str] = []
+        session_error = RuntimeError("session-close-visible-error")
+        original_session_close = fixture.session_spy.real.close
+        original_server_close = fixture.server.close
+
+        async def close_node_fail(*_args: object, **_kwargs: object) -> None:
+            call_order.append("node")
+            raise RuntimeError("node-close-suppressed-error")
+
+        async def close_session_fail() -> None:
+            call_order.append("session")
+            await original_session_close()
+            raise session_error
+
+        async def close_server_success() -> None:
+            call_order.append("server")
+            await original_server_close()
+
+        fixture.node.close = close_node_fail  # type: ignore[method-assign]
+        fixture.session_spy.real.close = close_session_fail  # type: ignore[method-assign]
+        fixture.server.close = close_server_success  # type: ignore[method-assign]
+
+        with self.assertRaises(RuntimeError) as raised:
+            await rig.close_fixture(
+                fixture,
+                suppress_errors=False,
+                suppress_node_close_error=True,
+            )
+        self.assertIs(raised.exception, session_error)
+        self.assertEqual(call_order, ["node", "session", "server"])
+        self.assertNotIn(fixture, rig.resources)
+        self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
+
+    async def test_close_fixture_suppressed_node_error_reraises_server_failure_when_session_succeeds(self) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        fixture = await rig.make_node(
+            identifier="close-fixture-server-failure-visible",
+            websocket_handler=make_ready_websocket_handler("close-fixture-server-failure-visible"),
+            managed=True,
+        )
+
+        call_order: list[str] = []
+        server_error = RuntimeError("server-close-visible-error")
+        original_session_close = fixture.session_spy.real.close
+        original_server_close = fixture.server.close
+
+        async def close_node_fail(*_args: object, **_kwargs: object) -> None:
+            call_order.append("node")
+            raise RuntimeError("node-close-suppressed-error")
+
+        async def close_session_success() -> None:
+            call_order.append("session")
+            await original_session_close()
+
+        async def close_server_fail() -> None:
+            call_order.append("server")
+            await original_server_close()
+            raise server_error
+
+        fixture.node.close = close_node_fail  # type: ignore[method-assign]
+        fixture.session_spy.real.close = close_session_success  # type: ignore[method-assign]
+        fixture.server.close = close_server_fail  # type: ignore[method-assign]
+
+        with self.assertRaises(RuntimeError) as raised:
+            await rig.close_fixture(
+                fixture,
+                suppress_errors=False,
+                suppress_node_close_error=True,
+            )
+        self.assertIs(raised.exception, server_error)
+        self.assertEqual(call_order, ["node", "session", "server"])
+        self.assertNotIn(fixture, rig.resources)
+        self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
+
     async def test_rig_close_surfaces_first_resource_failure_and_settles_later_resources(self) -> None:
         rig = LifecycleFixtureRig()
         await rig.enter()

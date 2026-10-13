@@ -573,20 +573,28 @@ class LifecycleFixtureRig:
         if first_error is not None:
             raise first_error
 
-    async def close_fixture(self, fixture: FixtureNode, *, suppress_errors: bool = False) -> None:
+    async def close_fixture(
+        self,
+        fixture: FixtureNode,
+        *,
+        suppress_errors: bool = False,
+        suppress_node_close_error: bool = False,
+    ) -> None:
         import wavelink
 
         first_error: BaseException | None = None
 
-        async def run(operation: Awaitable[Any]) -> None:
+        async def run(operation: Awaitable[Any], *, suppress_error: bool = False) -> None:
             nonlocal first_error
             try:
                 await asyncio.wait_for(operation, timeout=5.0)
             except BaseException as exc:
+                if suppress_error:
+                    return
                 if first_error is None:
                     first_error = exc
 
-        await run(fixture.node.close(eject=True))
+        await run(fixture.node.close(eject=True), suppress_error=suppress_node_close_error)
         await run(fixture.session_spy.real.close())
         await run(fixture.server.close())
         self.force_pool_remove(fixture.node)
