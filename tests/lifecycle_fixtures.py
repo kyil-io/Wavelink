@@ -223,17 +223,27 @@ def build_ready_payload(session_id: str, *, resumed: bool = False) -> dict[str, 
     return {"op": "ready", "resumed": resumed, "sessionId": session_id}
 
 
-def build_player_update_payload(
-    guild_id: str, *, time: int = 0, position: int = 0, ping: int = 0
-) -> dict[str, Any]:
+def build_player_update_payload(guild_id: str, *, time: int = 0, position: int = 0, ping: int = 0) -> dict[str, Any]:
     return {"op": "playerUpdate", "guildId": guild_id, "state": {"time": time, "position": position, "ping": ping}}
 
 
-async def close_when_client_finishes(websocket: web.WebSocketResponse) -> web.WebSocketResponse:
+async def close_when_client_finishes(
+    websocket: web.WebSocketResponse,
+    *,
+    waiting_for_client_close: asyncio.Event | None = None,
+    client_close_observed: asyncio.Event | None = None,
+    server_close_started: asyncio.Event | None = None,
+) -> web.WebSocketResponse:
+    if waiting_for_client_close is not None:
+        waiting_for_client_close.set()
     while not websocket.closed:
         message = await websocket.receive()
         if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+            if client_close_observed is not None:
+                client_close_observed.set()
             break
+    if server_close_started is not None:
+        server_close_started.set()
     await websocket.close()
     return websocket
 
@@ -267,6 +277,9 @@ def make_pre_ready_close_then_handshake_failure_handler(
     reconnect_attempted: asyncio.Event | None = None,
     send_invalid_json_before_close: bool = False,
     wait_for_client_close: bool = False,
+    wait_for_client_close_entered: asyncio.Event | None = None,
+    client_close_observed: asyncio.Event | None = None,
+    server_close_started: asyncio.Event | None = None,
 ) -> Callable[[web.Request, int], Awaitable[web.StreamResponse]]:
     async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
         if number == 1:
@@ -275,7 +288,12 @@ def make_pre_ready_close_then_handshake_failure_handler(
             if send_invalid_json_before_close:
                 await websocket.send_str("{")
             if wait_for_client_close:
-                return await close_when_client_finishes(websocket)
+                return await close_when_client_finishes(
+                    websocket,
+                    waiting_for_client_close=wait_for_client_close_entered,
+                    client_close_observed=client_close_observed,
+                    server_close_started=server_close_started,
+                )
             await websocket.close()
             return websocket
         if reconnect_attempted is not None:
@@ -522,9 +540,7 @@ class LifecycleFixtureRig:
 
         if wavelink.Pool.nodes:
             node_identifiers = tuple(wavelink.Pool.nodes)
-            raise RuntimeError(
-                f"Pool.nodes must be empty before lifecycle rig setup, found {node_identifiers}"
-            )
+            raise RuntimeError(f"Pool.nodes must be empty before lifecycle rig setup, found {node_identifiers}")
 
         self.client = discord.Client(intents=discord.Intents.none())
         install_offline_client_user(self.client)
@@ -536,14 +552,26 @@ class LifecycleFixtureRig:
         if not self._entered:
             return
 
-        for resource in reversed(self.resources):
-            await self.close_fixture(resource, suppress_errors=True)
+        first_error: BaseException | None = None
+
+        async def run(operation: Awaitable[Any]) -> None:
+            nonlocal first_error
+            try:
+                await operation
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+
+        for resource in tuple(reversed(self.resources)):
+            await run(self.close_fixture(resource, suppress_errors=False))
         self.resources.clear()
 
         if self.client is not None:
-            await asyncio.wait_for(self.client.__aexit__(None, None, None), timeout=5.0)
+            await run(asyncio.wait_for(self.client.__aexit__(None, None, None), timeout=5.0))
             self.client = None
         self._entered = False
+        if first_error is not None:
+            raise first_error
 
     async def close_fixture(self, fixture: FixtureNode, *, suppress_errors: bool = False) -> None:
         import wavelink

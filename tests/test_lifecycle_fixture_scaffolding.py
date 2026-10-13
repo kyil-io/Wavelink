@@ -88,6 +88,9 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
 
     async def test_pre_ready_close_handler_wait_for_client_close_keeps_client_as_close_initiator(self) -> None:
         reconnect_attempted = asyncio.Event()
+        wait_for_client_close_entered = asyncio.Event()
+        client_close_observed = asyncio.Event()
+        server_close_started = asyncio.Event()
         rig = LifecycleFixtureRig()
         await rig.enter()
         self.addAsyncCleanup(rig.close)
@@ -98,6 +101,9 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
                 handshake_status=401,
                 reconnect_attempted=reconnect_attempted,
                 wait_for_client_close=True,
+                wait_for_client_close_entered=wait_for_client_close_entered,
+                client_close_observed=client_close_observed,
+                server_close_started=server_close_started,
             ),
             managed=False,
         )
@@ -106,15 +112,17 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(f"{fixture.server.uri}/v4/websocket") as websocket:
                 receive_task = asyncio.create_task(websocket.receive())
-                done, pending = await asyncio.wait({receive_task}, timeout=0.05)
-                self.assertFalse(done, "server should wait for client close when wait_for_client_close=True")
-                self.assertIn(receive_task, pending)
+                await asyncio.wait_for(wait_for_client_close_entered.wait(), timeout=1.0)
+                self.assertFalse(receive_task.done())
+                self.assertFalse(server_close_started.is_set())
                 await websocket.close()
                 close_message = await asyncio.wait_for(receive_task, timeout=1.0)
                 self.assertIn(
                     close_message.type,
                     (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING),
                 )
+                await asyncio.wait_for(client_close_observed.wait(), timeout=1.0)
+                self.assertTrue(server_close_started.is_set())
 
             with self.assertRaises(aiohttp.WSServerHandshakeError) as raised:
                 await session.ws_connect(f"{fixture.server.uri}/v4/websocket")
@@ -353,3 +361,49 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_order, ["node", "session", "server"])
         self.assertNotIn(fixture, rig.resources)
         self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
+
+    async def test_rig_close_surfaces_first_resource_failure_and_settles_later_resources(self) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+
+        first_fixture = await rig.make_node(
+            identifier="close-rig-first",
+            websocket_handler=make_ready_websocket_handler("close-rig-first"),
+            managed=True,
+        )
+        second_fixture = await rig.make_node(
+            identifier="close-rig-second",
+            websocket_handler=make_ready_websocket_handler("close-rig-second"),
+            managed=True,
+        )
+
+        call_order: list[str] = []
+        first_error = RuntimeError("close-rig-first-error")
+        original_first_session_close = first_fixture.session_spy.real.close
+        original_second_session_close = second_fixture.session_spy.real.close
+
+        async def close_second_node_fail(*_args: object, **_kwargs: object) -> None:
+            call_order.append("second-node")
+            raise first_error
+
+        async def close_first_session() -> None:
+            call_order.append("first-session")
+            await original_first_session_close()
+
+        async def close_second_session() -> None:
+            call_order.append("second-session")
+            await original_second_session_close()
+
+        second_fixture.node.close = close_second_node_fail  # type: ignore[method-assign]
+        first_fixture.session_spy.real.close = close_first_session  # type: ignore[method-assign]
+        second_fixture.session_spy.real.close = close_second_session  # type: ignore[method-assign]
+
+        with self.assertRaises(RuntimeError) as raised:
+            await rig.close()
+        self.assertIs(raised.exception, first_error)
+        self.assertEqual(call_order, ["second-node", "second-session", "first-session"])
+        self.assertTrue(first_fixture.session_spy.real.closed)
+        self.assertTrue(second_fixture.session_spy.real.closed)
+        self.assertFalse(rig.resources)
+        self.assertIsNone(rig.client)
+        self.assertFalse(rig._entered)
