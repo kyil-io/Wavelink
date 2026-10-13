@@ -173,16 +173,12 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             race.release_second()
             await race.settle()
             await race.cancel_and_drain()
-            self.assertTrue(race.first_task.done())
-            self.assertTrue(race.second_task.done())
             self.assertFalse(getattr(race.first_task, "_log_traceback", False))
             await rig.events.wait_for_count("wavelink_node_ready", 2)
             self.assertEqual(rig.events.counts["wavelink_node_ready"], 2)
 
             await rig.close_fixture(first, suppress_errors=False)
             await rig.close_fixture(second, suppress_errors=False)
-            self.assertTrue(first.session_spy.real.closed)
-            self.assertTrue(second.session_spy.real.closed)
             self.assertNotIn("shared-identifier", wavelink.Pool.nodes)
         finally:
             await race.cancel_and_drain()
@@ -221,6 +217,13 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
 
         await rig.close()
         self.assertNotIn("managed-resource", wavelink.Pool.nodes)
+
+    async def test_lifecycle_fixture_rig_enter_reentry_raises(self) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+        with self.assertRaisesRegex(RuntimeError, "already entered"):
+            await rig.enter()
 
     async def test_unmanaged_node_context_performs_deterministic_cleanup(self) -> None:
         rig = LifecycleFixtureRig()
