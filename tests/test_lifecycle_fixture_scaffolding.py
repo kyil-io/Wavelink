@@ -359,6 +359,45 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await asyncio.wait_for(first_blocked_validation, timeout=1.0))
         self.assertFalse(await asyncio.wait_for(second_blocked_validation, timeout=1.0))
 
+    async def test_final_registration_generation_barrier_cancelled_candidate_does_not_satisfy_rendezvous(self) -> None:
+        class DummyNode:
+            def __init__(self) -> None:
+                self.validation_entered = asyncio.Event()
+
+            async def _connect(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
+                self.validation_entered.set()
+                return False
+
+        first = DummyNode()
+        second = DummyNode()
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
+        barrier.install(first)  # type: ignore[arg-type]
+        barrier.install(second)  # type: ignore[arg-type]
+
+        await first._connect()
+        await second._connect()
+
+        first_blocked_validation = asyncio.create_task(first._is_connect_generation_invalid(generation=1))
+        await asyncio.wait_for(first.validation_entered.wait(), timeout=1.0)
+        self.assertFalse(barrier.all_candidates_blocked.is_set())
+        self.assertFalse(first_blocked_validation.done())
+
+        first_blocked_validation.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(first_blocked_validation, timeout=1.0)
+        self.assertFalse(barrier.all_candidates_blocked.is_set())
+
+        second_blocked_validation = asyncio.create_task(second._is_connect_generation_invalid(generation=1))
+        await asyncio.wait_for(second.validation_entered.wait(), timeout=1.0)
+        self.assertFalse(barrier.all_candidates_blocked.is_set())
+        self.assertFalse(second_blocked_validation.done())
+
+        barrier.release()
+        self.assertFalse(await asyncio.wait_for(second_blocked_validation, timeout=1.0))
+
     async def test_final_registration_generation_barrier_validation_exception_keeps_one_shot_for_later_success(
         self,
     ) -> None:

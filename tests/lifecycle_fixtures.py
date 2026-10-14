@@ -495,6 +495,7 @@ class FinalRegistrationGenerationBarrier:
     def __init__(self, *, candidate_count: int) -> None:
         self._candidate_count = candidate_count
         self._entered_count = 0
+        self._rendezvous_completed = False
         self._lock = asyncio.Lock()
         self._release = asyncio.Event()
         self.all_candidates_blocked = asyncio.Event()
@@ -544,11 +545,25 @@ class FinalRegistrationGenerationBarrier:
         async def block_after_final_generation_validation(*args: Any, **kwargs: Any) -> bool:
             invalid = await original_is_connect_generation_invalid(*args, **kwargs)
             if self._gate_armed_by_node.pop(node_identifier, False):
-                async with self._lock:
-                    self._entered_count += 1
-                    if self._entered_count >= self._candidate_count:
-                        self.all_candidates_blocked.set()
-                await self._release.wait()
+                entered = False
+                try:
+                    async with self._lock:
+                        self._entered_count += 1
+                        entered = True
+                        if self._entered_count >= self._candidate_count:
+                            self._rendezvous_completed = True
+                            self.all_candidates_blocked.set()
+                    await self._release.wait()
+                finally:
+                    if entered:
+                        async with self._lock:
+                            self._entered_count = max(0, self._entered_count - 1)
+                            if (
+                                not self._rendezvous_completed
+                                and self._entered_count < self._candidate_count
+                                and self.all_candidates_blocked.is_set()
+                            ):
+                                self.all_candidates_blocked.clear()
             return invalid
 
         node._connect = connect_then_arm  # type: ignore[method-assign]
