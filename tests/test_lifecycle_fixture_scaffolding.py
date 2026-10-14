@@ -266,9 +266,11 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
 
         node = DummyNode()
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        connect = barrier.connect_then_arm(candidate="node-1", connect=node._connect)
+        candidate_token = barrier.create_candidate_token()
+        connect = barrier.connect_then_arm(candidate_token=candidate_token, connect=node._connect)
         validate = barrier.delegated_validation_then_block(
-            candidate="node-1", validate=node._is_connect_generation_invalid
+            candidate_token=candidate_token,
+            validate=node._is_connect_generation_invalid,
         )
 
         self.assertIs(await validate(generation=1), validation_result)
@@ -304,9 +306,11 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             return False
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        connect = barrier.connect_then_arm(candidate=fixture.node.identifier, connect=fixture.node._connect)
+        candidate_token = barrier.create_candidate_token()
+        connect = barrier.connect_then_arm(candidate_token=candidate_token, connect=fixture.node._connect)
         validate = barrier.delegated_validation_then_block(
-            candidate=fixture.node.identifier, validate=explicit_validation
+            candidate_token=candidate_token,
+            validate=explicit_validation,
         )
 
         await connect(client=rig.client)
@@ -319,6 +323,91 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await asyncio.wait_for(validate(generation=2), timeout=1.0))
         await rig.close_fixture(fixture, suppress_errors=False)
 
+    async def test_final_registration_generation_barrier_requires_explicit_candidate_tokens(self) -> None:
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
+
+        async def connect(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def validate(*_args: object, **_kwargs: object) -> bool:
+            return False
+
+        with self.assertRaises(TypeError):
+            barrier.connect_then_arm(candidate_token="shared-identifier", connect=connect)
+        with self.assertRaises(TypeError):
+            barrier.delegated_validation_then_block(
+                candidate_token="shared-identifier",
+                validate=validate,
+            )
+
+    async def test_final_registration_generation_barrier_blocks_two_same_identifier_nodes_with_unique_tokens(
+        self,
+    ) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        first = await rig.make_node(
+            identifier="shared-identifier",
+            websocket_handler=make_ready_websocket_handler("same-id-first"),
+            managed=False,
+        )
+        second = await rig.make_node(
+            identifier="shared-identifier",
+            websocket_handler=make_ready_websocket_handler("same-id-second"),
+            managed=False,
+        )
+        self.addAsyncCleanup(rig.close_fixture, second, suppress_errors=True)
+        self.addAsyncCleanup(rig.close_fixture, first, suppress_errors=True)
+
+        if rig.client is None:
+            raise RuntimeError("LifecycleFixtureRig.enter() must initialize client")
+
+        first_validation_entered = asyncio.Event()
+        second_validation_entered = asyncio.Event()
+
+        async def first_validate(*_args: object, **_kwargs: object) -> bool:
+            first_validation_entered.set()
+            return False
+
+        async def second_validate(*_args: object, **_kwargs: object) -> bool:
+            second_validation_entered.set()
+            return False
+
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
+        first_token = barrier.create_candidate_token()
+        second_token = barrier.create_candidate_token()
+
+        first_connect = barrier.connect_then_arm(candidate_token=first_token, connect=first.node._connect)
+        second_connect = barrier.connect_then_arm(candidate_token=second_token, connect=second.node._connect)
+        first_gated_validate = barrier.delegated_validation_then_block(
+            candidate_token=first_token,
+            validate=first_validate,
+        )
+        second_gated_validate = barrier.delegated_validation_then_block(
+            candidate_token=second_token,
+            validate=second_validate,
+        )
+
+        await first_connect(client=rig.client)
+        await second_connect(client=rig.client)
+
+        first_blocked_validation = asyncio.create_task(first_gated_validate(generation=1))
+        await asyncio.wait_for(first_validation_entered.wait(), timeout=1.0)
+        self.assertFalse(barrier.all_candidates_blocked.is_set())
+        self.assertFalse(first_blocked_validation.done())
+
+        second_blocked_validation = asyncio.create_task(second_gated_validate(generation=1))
+        await asyncio.wait_for(second_validation_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(barrier.all_candidates_blocked.wait(), timeout=1.0)
+        self.assertFalse(second_blocked_validation.done())
+
+        barrier.release()
+        self.assertFalse(await asyncio.wait_for(first_blocked_validation, timeout=1.0))
+        self.assertFalse(await asyncio.wait_for(second_blocked_validation, timeout=1.0))
+        self.assertFalse(await asyncio.wait_for(first_gated_validate(generation=2), timeout=1.0))
+        self.assertFalse(await asyncio.wait_for(second_gated_validate(generation=2), timeout=1.0))
+
     async def test_final_registration_generation_barrier_preserves_connect_exception_without_arming(self) -> None:
         connect_error = RuntimeError("connect-failed")
 
@@ -329,8 +418,9 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             return False
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        connect = barrier.connect_then_arm(candidate="node-1", connect=failing_connect)
-        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
+        candidate_token = barrier.create_candidate_token()
+        connect = barrier.connect_then_arm(candidate_token=candidate_token, connect=failing_connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate_token=candidate_token, validate=validate)
 
         with self.assertRaises(RuntimeError) as raised_connect:
             await connect()
@@ -354,10 +444,18 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             return False
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
-        first_connect = barrier.connect_then_arm(candidate="first", connect=connect)
-        second_connect = barrier.connect_then_arm(candidate="second", connect=connect)
-        first_gated_validate = barrier.delegated_validation_then_block(candidate="first", validate=first_validate)
-        second_gated_validate = barrier.delegated_validation_then_block(candidate="second", validate=second_validate)
+        first_token = barrier.create_candidate_token()
+        second_token = barrier.create_candidate_token()
+        first_connect = barrier.connect_then_arm(candidate_token=first_token, connect=connect)
+        second_connect = barrier.connect_then_arm(candidate_token=second_token, connect=connect)
+        first_gated_validate = barrier.delegated_validation_then_block(
+            candidate_token=first_token,
+            validate=first_validate,
+        )
+        second_gated_validate = barrier.delegated_validation_then_block(
+            candidate_token=second_token,
+            validate=second_validate,
+        )
 
         await first_connect()
         await second_connect()
@@ -392,10 +490,18 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             return False
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
-        first_connect = barrier.connect_then_arm(candidate="first", connect=connect)
-        second_connect = barrier.connect_then_arm(candidate="second", connect=connect)
-        first_gated_validate = barrier.delegated_validation_then_block(candidate="first", validate=first_validate)
-        second_gated_validate = barrier.delegated_validation_then_block(candidate="second", validate=second_validate)
+        first_token = barrier.create_candidate_token()
+        second_token = barrier.create_candidate_token()
+        first_connect = barrier.connect_then_arm(candidate_token=first_token, connect=connect)
+        second_connect = barrier.connect_then_arm(candidate_token=second_token, connect=connect)
+        first_gated_validate = barrier.delegated_validation_then_block(
+            candidate_token=first_token,
+            validate=first_validate,
+        )
+        second_gated_validate = barrier.delegated_validation_then_block(
+            candidate_token=second_token,
+            validate=second_validate,
+        )
 
         await first_connect()
         await second_connect()
@@ -434,8 +540,9 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             return False
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        gated_connect = barrier.connect_then_arm(candidate="node-1", connect=connect)
-        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
+        candidate_token = barrier.create_candidate_token()
+        gated_connect = barrier.connect_then_arm(candidate_token=candidate_token, connect=connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate_token=candidate_token, validate=validate)
         await gated_connect()
 
         with self.assertRaises(RuntimeError) as raised_validation:
@@ -464,8 +571,9 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             return False
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        gated_connect = barrier.connect_then_arm(candidate="node-1", connect=connect)
-        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
+        candidate_token = barrier.create_candidate_token()
+        gated_connect = barrier.connect_then_arm(candidate_token=candidate_token, connect=connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate_token=candidate_token, validate=validate)
 
         cancelled_connect = asyncio.create_task(gated_connect())
         await asyncio.wait_for(connect_entered.wait(), timeout=1.0)
@@ -489,8 +597,9 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             return False
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        gated_connect = barrier.connect_then_arm(candidate="node-1", connect=connect)
-        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
+        candidate_token = barrier.create_candidate_token()
+        gated_connect = barrier.connect_then_arm(candidate_token=candidate_token, connect=connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate_token=candidate_token, validate=validate)
         await gated_connect()
 
         cancelled_validation = asyncio.create_task(gated_validate(generation=1))
@@ -516,9 +625,10 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         original_validation = node._is_connect_generation_invalid
 
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        node._connect = barrier.connect_then_arm(candidate="node-1", connect=node._connect)  # type: ignore[method-assign]
+        candidate_token = barrier.create_candidate_token()
+        node._connect = barrier.connect_then_arm(candidate_token=candidate_token, connect=node._connect)  # type: ignore[method-assign]
         node._is_connect_generation_invalid = barrier.delegated_validation_then_block(  # type: ignore[method-assign]
-            candidate="node-1",
+            candidate_token=candidate_token,
             validate=node._is_connect_generation_invalid,
         )
 

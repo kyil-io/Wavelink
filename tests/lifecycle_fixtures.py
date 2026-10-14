@@ -492,6 +492,15 @@ class CloseJoinBarrier:
 
 
 class FinalRegistrationGenerationBarrier:
+    """One-shot rendezvous barrier for connect/validation wrapper pairs.
+
+    Callers must allocate a unique candidate token per wrapper pair via
+    :meth:`create_candidate_token` and reuse that exact token object for both
+    ``connect_then_arm`` and ``delegated_validation_then_block``.
+
+    This prevents key collisions when distinct nodes share identifiers.
+    """
+
     def __init__(self, *, candidate_count: int) -> None:
         self._candidate_count = candidate_count
         self._entered_count = 0
@@ -499,7 +508,11 @@ class FinalRegistrationGenerationBarrier:
         self._lock = asyncio.Lock()
         self._release = asyncio.Event()
         self.all_candidates_blocked = asyncio.Event()
-        self._gate_armed_by_candidate: dict[object, bool] = {}
+        self._gate_armed_by_candidate: dict[_BarrierCandidateToken, bool] = {}
+
+    def create_candidate_token(self) -> _BarrierCandidateToken:
+        """Create a unique opaque token for a connect/validation wrapper pair."""
+        return _BarrierCandidateToken()
 
     def release(self) -> None:
         self._release.set()
@@ -507,12 +520,14 @@ class FinalRegistrationGenerationBarrier:
     def connect_then_arm(
         self,
         *,
-        candidate: object,
+        candidate_token: object,
         connect: Callable[..., Coroutine[Any, Any, _ConnectResultT]],
     ) -> Callable[..., Coroutine[Any, Any, _ConnectResultT]]:
+        resolved_token = self._require_candidate_token(candidate_token)
+
         async def wrapped_connect(*args: Any, **kwargs: Any) -> _ConnectResultT:
             result = await connect(*args, **kwargs)
-            self._gate_armed_by_candidate[candidate] = True
+            self._gate_armed_by_candidate[resolved_token] = True
             return result
 
         return wrapped_connect
@@ -520,12 +535,14 @@ class FinalRegistrationGenerationBarrier:
     def delegated_validation_then_block(
         self,
         *,
-        candidate: object,
+        candidate_token: object,
         validate: Callable[..., Coroutine[Any, Any, _ValidationResultT]],
     ) -> Callable[..., Coroutine[Any, Any, _ValidationResultT]]:
+        resolved_token = self._require_candidate_token(candidate_token)
+
         async def wrapped_validation(*args: Any, **kwargs: Any) -> _ValidationResultT:
             validation_result = await validate(*args, **kwargs)
-            if self._gate_armed_by_candidate.pop(candidate, False):
+            if self._gate_armed_by_candidate.pop(resolved_token, False):
                 entered = False
                 try:
                     async with self._lock:
@@ -549,9 +566,22 @@ class FinalRegistrationGenerationBarrier:
 
         return wrapped_validation
 
+    @staticmethod
+    def _require_candidate_token(candidate_token: object) -> _BarrierCandidateToken:
+        if not isinstance(candidate_token, _BarrierCandidateToken):
+            raise TypeError(
+                "FinalRegistrationGenerationBarrier candidate_token must come from "
+                "create_candidate_token() and be reused for connect/validation wrappers."
+            )
+        return candidate_token
+
 
 _ConnectResultT = TypeVar("_ConnectResultT")
 _ValidationResultT = TypeVar("_ValidationResultT")
+
+
+class _BarrierCandidateToken:
+    __slots__ = ()
 
 
 @dataclass
