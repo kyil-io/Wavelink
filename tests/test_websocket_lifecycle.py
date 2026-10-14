@@ -563,40 +563,39 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                         "reconnect failure should dispatch disconnected exactly once per connected interval",
                     )
                     self.assertIsInstance(getattr(reconnect_task, "_exception", None), expected_exception)
-                    self.assertFalse(
-                        getattr(reconnect_task, "_log_traceback", False),
-                        "reconnect task exception should be observed to avoid unretrieved-task diagnostics",
-                    )
+                    self.assertFalse(getattr(reconnect_task, "_log_traceback", False))
                 finally:
                     await self._cleanup_unmanaged_fixture(fixture)
 
     async def test_pre_ready_close_then_reconnect_handshake_failure_never_dispatches_disconnect(self) -> None:
         for status, expected_exception in ((401, wavelink.AuthorizationFailedException), (404, wavelink.NodeException)):
             with self.subTest(status=status):
-                reconnect_attempted = asyncio.Event()
+                reconnect_attempted, reconnect_release = asyncio.Event(), asyncio.Event()
                 fixture = await self._make_unmanaged_node(
                     identifier=f"pre-ready-close-reconnect-{status}",
                     websocket_handler=make_pre_ready_close_then_handshake_failure_handler(
-                        handshake_status=status, reconnect_attempted=reconnect_attempted, wait_for_client_close=True
+                        handshake_status=status,
+                        reconnect_attempted=reconnect_attempted,
+                        reconnect_release=reconnect_release,
+                        wait_for_client_close=True,
                     ),
                     retries=1,
                 )
                 try:
-                    disconnected_before = self.events.counts["wavelink_node_disconnected"]
                     await asyncio.wait_for(wavelink.Pool.connect(nodes=[fixture.node], client=self.client), timeout=5.0)
                     lifecycle = fixture.node._websocket
                     assert lifecycle is not None and lifecycle.socket is not None
                     await asyncio.wait_for(lifecycle.socket.close(), timeout=5.0)
                     await asyncio.wait_for(reconnect_attempted.wait(), timeout=5.0)
                     reconnect_task = lifecycle.reconnect_task
+                    assert reconnect_task is not None and not reconnect_task.done()
+                    reconnect_release.set()
                     await asyncio.wait_for(asyncio.wait({reconnect_task}), timeout=5.0)
-                    self.assertEqual(self.events.counts["wavelink_node_disconnected"] - disconnected_before, 0)
+                    self.assertEqual(self.events.counts["wavelink_node_disconnected"], 0)
                     self.assertIsInstance(getattr(reconnect_task, "_exception", None), expected_exception)
-                    self.assertFalse(
-                        getattr(reconnect_task, "_log_traceback", False),
-                        "pre-ready reconnect handshake failures should be consumed/observed",
-                    )
+                    self.assertFalse(getattr(reconnect_task, "_log_traceback", False))
                 finally:
+                    reconnect_release.set()
                     await self._cleanup_unmanaged_fixture(fixture)
 
     async def test_concurrent_connect_same_identifier_retires_loser_resources_and_events(self) -> None:

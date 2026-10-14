@@ -346,6 +346,7 @@ def make_pre_ready_close_then_handshake_failure_handler(
     *,
     handshake_status: int,
     reconnect_attempted: asyncio.Event | None = None,
+    reconnect_release: asyncio.Event | None = None,
     send_invalid_json_before_close: bool = False,
     wait_for_client_close: bool = False,
     wait_for_client_close_entered: asyncio.Event | None = None,
@@ -369,6 +370,8 @@ def make_pre_ready_close_then_handshake_failure_handler(
             return websocket
         if reconnect_attempted is not None:
             reconnect_attempted.set()
+        if reconnect_release is not None:
+            await reconnect_release.wait()
         return web.Response(status=handshake_status)
 
     return websocket_handler
