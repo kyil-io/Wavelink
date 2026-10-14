@@ -187,11 +187,7 @@ class Websocket:
                     self.socket = await session.ws_connect(url=uri, heartbeat=heartbeat, headers=self.headers)  # type: ignore
                 except Exception as e:
                     if isinstance(e, aiohttp.WSServerHandshakeError) and e.status in (401, 404):
-                        if (
-                            is_reconnect_task
-                            and self._connected_interval_active
-                            and not self._connected_interval_disconnected
-                        ):
+                        if is_reconnect_task and self._connected_interval_active:
                             self._force_disconnected_dispatch = True
                         await self.cleanup()
                         if e.status == 401:
