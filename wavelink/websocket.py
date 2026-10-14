@@ -186,26 +186,27 @@ class Websocket:
                 try:
                     self.socket = await session.ws_connect(url=uri, heartbeat=heartbeat, headers=self.headers)  # type: ignore
                 except Exception as e:
-                    if isinstance(e, aiohttp.WSServerHandshakeError) and e.status == 401:
-                        if is_reconnect_task and not self._connected_interval_disconnected:
+                    if isinstance(e, aiohttp.WSServerHandshakeError) and e.status in (401, 404):
+                        if (
+                            is_reconnect_task
+                            and self._connected_interval_active
+                            and not self._connected_interval_disconnected
+                        ):
                             self._force_disconnected_dispatch = True
                         await self.cleanup()
-                        raise AuthorizationFailedException from e
-                    elif isinstance(e, aiohttp.WSServerHandshakeError) and e.status == 404:
-                        if is_reconnect_task and not self._connected_interval_disconnected:
-                            self._force_disconnected_dispatch = True
-                        await self.cleanup()
+                        if e.status == 401:
+                            raise AuthorizationFailedException from e
                         raise NodeException from e
-                    else:
-                        logger.warning(
-                            (
-                                'An unexpected error occurred while connecting %r to Lavalink: "%s"\n'
-                                "If this error persists or wavelink is unable to reconnect, please see: %s"
-                            ),
-                            self.node,
-                            e,
-                            github,
-                        )
+
+                    logger.warning(
+                        (
+                            'An unexpected error occurred while connecting %r to Lavalink: "%s"\n'
+                            "If this error persists or wavelink is unable to reconnect, please see: %s"
+                        ),
+                        self.node,
+                        e,
+                        github,
+                    )
 
                 if self.is_connected():
                     keep_alive_task = asyncio.create_task(self.keep_alive())
@@ -440,16 +441,11 @@ class Websocket:
 
     async def _drain_cleanup_snapshot(self) -> None:
         current_task = asyncio.current_task()
-        for task in self._cleanup_snapshot:
-            if task is current_task or task.done():
-                continue
+        pending = tuple(task for task in self._cleanup_snapshot if task is not current_task and not task.done())
+        if not pending:
+            return
 
-            try:
-                await task
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                continue
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @dataclass(frozen=True, slots=True)
