@@ -274,15 +274,56 @@ def make_blocked_ready_websocket_handler(
     *,
     ready_release: asyncio.Event,
     transport_connected: asyncio.Event | None = None,
+    client_close_won: asyncio.Event | None = None,
+    handler_cancelled_before_release: asyncio.Event | None = None,
+    handler_task_ready: asyncio.Future[asyncio.Task[Any]] | None = None,
     include_connection_number: bool = False,
     extra_payloads: Sequence[dict[str, Any]] = (),
 ) -> Callable[[web.Request, int], Awaitable[web.StreamResponse]]:
+    async def cancel_and_drain(task: asyncio.Task[Any]) -> None:
+        if task.done():
+            with contextlib.suppress(BaseException):
+                task.result()
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
     async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
         websocket = web.WebSocketResponse()
         await websocket.prepare(request)
         if transport_connected is not None:
             transport_connected.set()
-        await ready_release.wait()
+        if handler_task_ready is not None and not handler_task_ready.done():
+            handler_task_ready.set_result(cast("asyncio.Task[Any]", asyncio.current_task()))
+        release_waiter = asyncio.create_task(ready_release.wait())
+        client_close_waiter = asyncio.create_task(wait_for_client_close(websocket))
+
+        try:
+            done, pending = await asyncio.wait(
+                (release_waiter, client_close_waiter),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            if handler_cancelled_before_release is not None and not ready_release.is_set():
+                handler_cancelled_before_release.set()
+            await cancel_and_drain(release_waiter)
+            await cancel_and_drain(client_close_waiter)
+            await websocket.close()
+            raise
+
+        if client_close_waiter in done:
+            if client_close_won is not None:
+                client_close_won.set()
+            for waiter in pending:
+                await cancel_and_drain(waiter)
+            await websocket.close()
+            return websocket
+
+        for waiter in pending:
+            await cancel_and_drain(waiter)
+        if websocket.closed:
+            return websocket
         ready_session_id = f"{session_id}-{number}" if include_connection_number else session_id
         await websocket.send_json(build_ready_payload(ready_session_id))
         for payload in extra_payloads:
@@ -448,11 +489,34 @@ class FinalRegistrationGenerationBarrier:
         self._lock = asyncio.Lock()
         self._release = asyncio.Event()
         self.all_candidates_blocked = asyncio.Event()
+        self._patched_nodes: dict[int, tuple[Any, Any, Any, Any, Any]] = {}
+        self._gate_armed_by_node: dict[int, bool] = {}
 
     def release(self) -> None:
         self._release.set()
 
+    def uninstall(self, node: wavelink.Node) -> None:
+        patch = self._patched_nodes.pop(id(node), None)
+        self._gate_armed_by_node.pop(id(node), None)
+        if patch is None:
+            return
+        original_connect, original_validation, wrapped_connect, wrapped_validation, patched_node = patch
+        if node is not patched_node:
+            return
+        if node._connect is wrapped_connect:
+            node._connect = original_connect  # type: ignore[method-assign]
+        current_validation = getattr(node, "_is_connect_generation_invalid", None)
+        if current_validation is wrapped_validation:
+            setattr(node, "_is_connect_generation_invalid", original_validation)
+
+    def cleanup(self) -> None:
+        for patch in tuple(self._patched_nodes.values()):
+            patched_node = patch[4]
+            self.uninstall(cast("wavelink.Node", patched_node))
+
     def install(self, node: wavelink.Node) -> None:
+        if id(node) in self._patched_nodes:
+            return
         if not hasattr(node, "_is_connect_generation_invalid"):
             raise AttributeError("FinalRegistrationGenerationBarrier requires node._is_connect_generation_invalid")
         original_connect = node._connect
@@ -460,18 +524,17 @@ class FinalRegistrationGenerationBarrier:
             "Callable[..., Awaitable[bool]]",
             getattr(node, "_is_connect_generation_invalid"),
         )
-        gate_armed = False
+        node_identifier = id(node)
+        self._gate_armed_by_node[node_identifier] = False
 
-        async def connect_then_arm(*args: Any, **kwargs: Any) -> None:
-            nonlocal gate_armed
-            await original_connect(*args, **kwargs)
-            gate_armed = True
+        async def connect_then_arm(*args: Any, **kwargs: Any) -> Any:
+            result = await original_connect(*args, **kwargs)
+            self._gate_armed_by_node[node_identifier] = True
+            return result
 
         async def block_after_final_generation_validation(*args: Any, **kwargs: Any) -> bool:
-            nonlocal gate_armed
             invalid = await original_is_connect_generation_invalid(*args, **kwargs)
-            if gate_armed:
-                gate_armed = False
+            if self._gate_armed_by_node.pop(node_identifier, False):
                 async with self._lock:
                     self._entered_count += 1
                     if self._entered_count >= self._candidate_count:
@@ -481,6 +544,13 @@ class FinalRegistrationGenerationBarrier:
 
         node._connect = connect_then_arm  # type: ignore[method-assign]
         setattr(node, "_is_connect_generation_invalid", block_after_final_generation_validation)
+        self._patched_nodes[node_identifier] = (
+            original_connect,
+            original_is_connect_generation_invalid,
+            connect_then_arm,
+            block_after_final_generation_validation,
+            node,
+        )
 
 
 @dataclass
@@ -490,6 +560,7 @@ class SameIdentifierConnectRace:
     first_task: asyncio.Task[object]
     second_task: asyncio.Task[object]
     final_registration_barrier: FinalRegistrationGenerationBarrier | None = None
+    final_registration_nodes: tuple[wavelink.Node, ...] = ()
 
     async def wait_until_both_candidates_ready(self, *, timeout: float = 5.0) -> None:
         if self.final_registration_barrier is not None:
@@ -519,20 +590,35 @@ class SameIdentifierConnectRace:
             self.second_gate.release()
 
     async def settle(self, *, timeout: float = 5.0) -> None:
-        await asyncio.wait_for(self.first_task, timeout=timeout)
-        await asyncio.wait_for(self.second_task, timeout=timeout)
+        try:
+            await asyncio.wait_for(self.first_task, timeout=timeout)
+            await asyncio.wait_for(self.second_task, timeout=timeout)
+        finally:
+            self._restore_final_registration_methods()
 
     async def cancel_and_drain(self, *, timeout: float = 5.0) -> None:
-        self.release_boundary()
-        tasks = (self.first_task, self.second_task)
-        for task in tasks:
-            if task.done():
-                continue
-            task.cancel()
+        try:
+            self.release_boundary()
+            tasks = (self.first_task, self.second_task)
+            for task in tasks:
+                if task.done():
+                    continue
+                task.cancel()
 
-        for task in tasks:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.wait_for(task, timeout=timeout)
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(task, timeout=timeout)
+        finally:
+            self._restore_final_registration_methods()
+
+    def _restore_final_registration_methods(self) -> None:
+        if self.final_registration_barrier is None:
+            return
+        if self.final_registration_nodes:
+            for node in self.final_registration_nodes:
+                self.final_registration_barrier.uninstall(node)
+            return
+        self.final_registration_barrier.cleanup()
 
 
 def begin_same_identifier_connect_race(
@@ -556,8 +642,13 @@ def begin_same_identifier_connect_race(
         second.session_spy.connect_return_gate = second_gate
     elif boundary == "final_registration":
         barrier = barrier or FinalRegistrationGenerationBarrier(candidate_count=2)
-        barrier.install(first.node)
-        barrier.install(second.node)
+        try:
+            barrier.install(first.node)
+            barrier.install(second.node)
+        except BaseException:
+            barrier.uninstall(first.node)
+            barrier.uninstall(second.node)
+            raise
     else:
         raise ValueError(f"Unknown same-identifier race boundary mode: {boundary}")
 
@@ -569,22 +660,21 @@ def begin_same_identifier_connect_race(
         first_task=first_task,
         second_task=second_task,
         final_registration_barrier=barrier if boundary == "final_registration" else None,
+        final_registration_nodes=(first.node, second.node) if boundary == "final_registration" else (),
     )
 
 
 @dataclass
 class SameIdentifierRaceObservation:
-    registered_node: wavelink.Node | None
-    winner_raw_socket: aiohttp.ClientWebSocketResponse | None
-    loser_raw_socket: aiohttp.ClientWebSocketResponse | None
-    open_raw_socket_count: int
-    loser_lifecycle_socket_matches_raw: bool
-    loser_socket_closed: bool
-    loser_tasks_settled: bool
-    ready_event_nodes: tuple[wavelink.Node, ...]
-    loser_player_update_count: int
-    winner_session_closed: bool
-    loser_session_closed: bool
+    identifier: str
+    first_candidate: FixtureNode
+    second_candidate: FixtureNode
+    registered_node_before_release: wavelink.Node | None
+    first_raw_socket_before_release: aiohttp.ClientWebSocketResponse
+    second_raw_socket_before_release: aiohttp.ClientWebSocketResponse
+    first_lifecycle_before_release: Any
+    second_lifecycle_before_release: Any
+    events: EventRecorder
 
 
 def observe_same_identifier_race(
@@ -596,43 +686,25 @@ def observe_same_identifier_race(
 ) -> SameIdentifierRaceObservation:
     import wavelink
 
-    winner_raw_socket = winner.session_spy.latest_raw_websocket
-    loser_raw_socket = loser.session_spy.latest_raw_websocket
-    open_raw_socket_count = sum(
-        int(socket is not None and not socket.closed) for socket in (winner_raw_socket, loser_raw_socket)
-    )
-
-    loser_lifecycle = loser.node._websocket
-    loser_lifecycle_socket = None if loser_lifecycle is None else loser_lifecycle.socket
-    wrapped_socket = None if loser_lifecycle_socket is None else getattr(loser_lifecycle_socket, "_websocket", None)
-    loser_lifecycle_socket_matches_raw = (
-        loser_lifecycle is not None
-        and loser_lifecycle_socket is not None
-        and loser_raw_socket is not None
-        and wrapped_socket is loser_raw_socket
-    )
-    loser_tasks_settled = loser_lifecycle is None or (
-        loser_lifecycle.keep_alive_task is None or loser_lifecycle.keep_alive_task.done()
-    )
-    ready_event_nodes = tuple(payload[0].node for payload in events.payloads["wavelink_node_ready"])
-    loser_player_update_count = sum(
-        1
-        for payload in events.payloads["wavelink_player_update"]
-        if payload and getattr(payload[0], "node", None) is loser.node
-    )
+    first_raw_socket = winner.session_spy.latest_raw_websocket
+    second_raw_socket = loser.session_spy.latest_raw_websocket
+    first_lifecycle = winner.node._websocket
+    second_lifecycle = loser.node._websocket
+    assert first_raw_socket is not None, "first candidate raw websocket should be captured before boundary release"
+    assert second_raw_socket is not None, "second candidate raw websocket should be captured before boundary release"
+    assert first_lifecycle is not None, "first candidate lifecycle should be captured before boundary release"
+    assert second_lifecycle is not None, "second candidate lifecycle should be captured before boundary release"
 
     return SameIdentifierRaceObservation(
-        registered_node=wavelink.Pool.nodes.get(identifier),
-        winner_raw_socket=winner_raw_socket,
-        loser_raw_socket=loser_raw_socket,
-        open_raw_socket_count=open_raw_socket_count,
-        loser_lifecycle_socket_matches_raw=loser_lifecycle_socket_matches_raw,
-        loser_socket_closed=bool(loser_raw_socket is not None and loser_raw_socket.closed),
-        loser_tasks_settled=loser_tasks_settled,
-        ready_event_nodes=ready_event_nodes,
-        loser_player_update_count=loser_player_update_count,
-        winner_session_closed=winner.session_spy.real.closed,
-        loser_session_closed=loser.session_spy.real.closed,
+        identifier=identifier,
+        first_candidate=winner,
+        second_candidate=loser,
+        registered_node_before_release=wavelink.Pool.nodes.get(identifier),
+        first_raw_socket_before_release=first_raw_socket,
+        second_raw_socket_before_release=second_raw_socket,
+        first_lifecycle_before_release=first_lifecycle,
+        second_lifecycle_before_release=second_lifecycle,
+        events=events,
     )
 
 
@@ -641,17 +713,46 @@ def assert_same_identifier_winner_loser_state(
     observation: SameIdentifierRaceObservation,
     winner: FixtureNode,
 ) -> None:
-    assert observation.winner_raw_socket is not None, "winner raw websocket should be captured"
-    assert observation.registered_node is winner.node, "Pool should retain the winner node identity"
-    assert observation.loser_lifecycle_socket_matches_raw, "loser lifecycle must reference the captured raw socket"
-    assert observation.loser_socket_closed, "loser raw socket should be closed"
-    assert observation.loser_tasks_settled, "loser keep-alive and reconnect tasks should be settled"
-    assert observation.open_raw_socket_count == 1, "exactly one raw socket should remain open"
-    assert len(observation.ready_event_nodes) == 1, "exactly one ready event should be published"
-    assert observation.ready_event_nodes[0] is winner.node, "ready event must name the winner"
-    assert observation.loser_player_update_count == 0, "loser should not publish player updates"
-    assert not observation.winner_session_closed, "winner session must remain externally open"
-    assert not observation.loser_session_closed, "loser session must remain externally open"
+    import wavelink
+
+    assert winner in (observation.first_candidate, observation.second_candidate), (
+        "winner fixture identity must match one captured candidate"
+    )
+    if winner is observation.first_candidate:
+        loser = observation.second_candidate
+        loser_lifecycle = observation.second_lifecycle_before_release
+        loser_raw_socket = observation.second_raw_socket_before_release
+    else:
+        loser = observation.first_candidate
+        loser_lifecycle = observation.first_lifecycle_before_release
+        loser_raw_socket = observation.first_raw_socket_before_release
+    assert wavelink.Pool.nodes.get(observation.identifier) is winner.node, "Pool should retain winner identity"
+    assert loser.node._websocket is None, "loser node lifecycle should be cleared after settlement"
+    assert loser_lifecycle.socket is not None, "captured loser lifecycle must have a socket"
+    assert loser_lifecycle.socket._websocket is loser_raw_socket, (
+        "captured loser lifecycle should wrap the loser raw socket observed at boundary"
+    )
+    assert loser_raw_socket.closed, "loser raw websocket should be closed after settlement"
+    loser_keep_alive_task = getattr(loser_lifecycle, "keep_alive_task", None)
+    loser_reconnect_task = getattr(loser_lifecycle, "reconnect_task", None)
+    assert loser_keep_alive_task is None or loser_keep_alive_task.done(), "loser keep-alive task should be settled"
+    assert loser_reconnect_task is None or loser_reconnect_task.done(), "loser reconnect task should be settled"
+    winner_raw_socket = winner.session_spy.latest_raw_websocket
+    assert winner_raw_socket is not None, "winner raw websocket should remain available"
+    assert (
+        sum(int(socket is not None and not socket.closed) for socket in (winner_raw_socket, loser_raw_socket)) == 1
+    ), "exactly one raw websocket should remain open"
+    ready_event_nodes = tuple(payload[0].node for payload in observation.events.payloads["wavelink_node_ready"])
+    assert len(ready_event_nodes) == 1, "exactly one ready event should be published"
+    assert ready_event_nodes[0] is winner.node, "ready event should name the winner"
+    loser_player_updates = sum(
+        1
+        for payload in observation.events.payloads["wavelink_player_update"]
+        if payload and getattr(payload[0], "node", None) is loser.node
+    )
+    assert loser_player_updates == 0, "loser should not dispatch player update events"
+    assert not winner.session_spy.real.closed, "winner session should remain externally managed and open"
+    assert not loser.session_spy.real.closed, "loser session should remain externally managed and open"
 
 
 class LoopbackLavalink:
