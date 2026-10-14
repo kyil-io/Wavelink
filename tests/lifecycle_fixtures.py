@@ -7,7 +7,7 @@ import socket
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import aiohttp
 import discord
@@ -30,6 +30,15 @@ INFO_PAYLOAD: dict[str, object] = {
     "filters": [],
     "plugins": [],
 }
+
+
+class ClientWebSocketLike(Protocol):
+    async def close(self, *args: Any, **kwargs: Any) -> bool: ...
+
+    async def receive(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    @property
+    def closed(self) -> bool: ...
 
 
 def install_offline_client_user(client: discord.Client) -> None:
@@ -57,7 +66,7 @@ class SessionSpy:
         self.ws_connect_calls = 0
         self.call_events: list[tuple[int, bool]] = []
         self.latest_wrapper_ref: weakref.ReferenceType[_TransparentClientWebSocket] | None = None
-        self.latest_raw_websocket: aiohttp.ClientWebSocketResponse | None = None
+        self.latest_raw_websocket: ClientWebSocketLike | None = None
         self.boundary_calls = 0
         self.boundary_marked = False
         self.post_boundary_call = asyncio.Event()
@@ -168,7 +177,7 @@ class ConnectCancelGate:
 
 
 class _TransparentClientWebSocket:
-    def __init__(self, websocket: aiohttp.ClientWebSocketResponse, session_spy: SessionSpy) -> None:
+    def __init__(self, websocket: ClientWebSocketLike, session_spy: SessionSpy) -> None:
         self._websocket = websocket
         self._session_spy = session_spy
 
@@ -194,7 +203,7 @@ class _TransparentClientWebSocket:
 
 
 class ScriptedCloseSocket:
-    def __init__(self, websocket: aiohttp.ClientWebSocketResponse, *, close_without_closing_attempts: int) -> None:
+    def __init__(self, websocket: ClientWebSocketLike, *, close_without_closing_attempts: int) -> None:
         self._websocket = websocket
         self._remaining_close_without_closing_attempts = close_without_closing_attempts
         self.close_calls = 0
