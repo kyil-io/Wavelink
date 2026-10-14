@@ -459,8 +459,7 @@ class Node:
             return
 
         async with self._close_state_lock:
-            current_state = self._close_state
-            if current_state is not state:
+            if (current_state := self._close_state) is None or current_state is not state:
                 return
 
             owner_incomplete = allow_owner_before_done and asyncio.current_task() is current_state.task
