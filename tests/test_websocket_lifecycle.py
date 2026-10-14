@@ -622,6 +622,8 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(loser_lifecycle.keep_alive_task is None or loser_lifecycle.keep_alive_task.done())
             self.assertTrue(loser_lifecycle.reconnect_task is None or loser_lifecycle.reconnect_task.done())
+            self.assertFalse(winner.session_spy.real.closed)
+            self.assertFalse(loser.session_spy.real.closed)
             self.assertEqual(self.events.counts["wavelink_player_update"], 0)
             self.assertIs(self.events.payloads["wavelink_node_ready"][0][0].node, winner.node)
         finally:
