@@ -13,6 +13,7 @@ from tests.lifecycle_fixtures import (
     ConnectReturnGate,
     FixtureNode,
     LifecycleFixtureRig,
+    ReceiveCancelGate,
     ScriptedCloseSocket,
     TransportCloseGate,
     begin_same_identifier_connect_race,
@@ -630,6 +631,57 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
             await race.cancel_and_drain()
             await self._cleanup_unmanaged_fixture(winner)
             await self._cleanup_unmanaged_fixture(loser)
+
+    async def test_obsolete_candidate_retirement_propagates_caller_cancellation_while_draining_owned_task(self) -> None:
+        fixture = await self._make_unmanaged_node(
+            identifier="obsolete-retirement-caller-cancel",
+            websocket_handler=make_ready_websocket_handler("obsolete-retirement-caller-cancel"),
+            retries=1,
+        )
+        receive_gate = ReceiveCancelGate()
+        fixture.session_spy.receive_gate = receive_gate
+        retirement_task: asyncio.Task[None] | None = None
+        owned_task: asyncio.Task[None] | None = None
+        unresolved_socket: Any | None = None
+        try:
+            await asyncio.wait_for(wavelink.Pool.connect(nodes=[fixture.node], client=self.client), timeout=5.0)
+            await self.events.wait_for_count("wavelink_node_ready", 1)
+            lifecycle = fixture.node._websocket
+            assert lifecycle is not None
+            owned_task = lifecycle.keep_alive_task
+            assert owned_task is not None
+
+            unresolved_socket = lifecycle.socket
+            assert unresolved_socket is not None
+            raw_socket = unresolved_socket._websocket
+            unresolved_socket._websocket = ScriptedCloseSocket(raw_socket, close_without_closing_attempts=1)
+
+            retirement_task = asyncio.create_task(fixture.node._retire_obsolete_connect_candidate(websocket=lifecycle))
+            await asyncio.wait_for(receive_gate.cancel_entered.wait(), timeout=5.0)
+            retirement_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(retirement_task, timeout=5.0)
+            self.assertTrue(retirement_task.cancelled())
+            receive_gate.release()
+            await asyncio.wait_for(owned_task, timeout=5.0)
+            self.assertTrue(owned_task.done())
+            self.assertTrue(owned_task.cancelled())
+            self.assertEqual(fixture.node._retained_candidate_sockets, [unresolved_socket])
+            self.assertFalse(unresolved_socket.closed)
+        finally:
+            receive_gate.release()
+            fixture.session_spy.receive_gate = None
+            if retirement_task is not None and not retirement_task.done():
+                retirement_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(retirement_task, timeout=5.0)
+            if owned_task is not None and not owned_task.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(owned_task, timeout=5.0)
+            if unresolved_socket is not None and not unresolved_socket.closed:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(unresolved_socket.close(), timeout=5.0)
+            await self._cleanup_unmanaged_fixture(fixture)
 
     async def test_obsolete_candidate_retirement_fail_closed_retains_unresolved_candidate_and_blocks_reuse(
         self,
