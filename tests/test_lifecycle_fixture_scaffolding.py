@@ -761,14 +761,14 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
                 rig.events.payloads["wavelink_node_ready"][0][0].node.identifier,
                 "shared-identifier",
             )
+            self.assertIs(rig.events.payloads["wavelink_node_ready"][0][0].node, first.node)
             self.assertFalse(race.second_task.done())
 
             race.release_second()
             await race.settle()
             await race.cancel_and_drain()
             self.assertFalse(getattr(race.first_task, "_log_traceback", False))
-            await rig.events.wait_for_count("wavelink_node_ready", 2)
-            self.assertEqual(rig.events.counts["wavelink_node_ready"], 2)
+            self.assertEqual(rig.events.counts["wavelink_node_ready"], 1)
 
             await rig.close_fixture(first, suppress_errors=False)
             await rig.close_fixture(second, suppress_errors=False)

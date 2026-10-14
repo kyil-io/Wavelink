@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -59,6 +60,74 @@ class Websocket:
 
         self.socket: aiohttp.ClientWebSocketResponse | None = None
         self.keep_alive_task: asyncio.Task[None] | None = None
+        self.reconnect_task: asyncio.Task[None] | None = None
+        self._cleanup_task: asyncio.Task[_CleanupOutcome] | None = None
+        self._cleanup_snapshot: tuple[asyncio.Task[Any], ...] = ()
+        self._connected_interval_active: bool = False
+        self._connected_interval_disconnected: bool = False
+        self._force_disconnected_dispatch: bool = False
+
+    @staticmethod
+    def _observe_task_result(task: asyncio.Task[Any], *, role: str, node: Node) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Unexpected %s task failure on node=%r", role, node.identifier)
+
+    def _retire_reconnect_task(self, task: asyncio.Task[Any]) -> None:
+        if self.reconnect_task is task:
+            self.reconnect_task = None
+        self._observe_task_result(task, role="reconnect", node=self.node)
+
+    def _dispatch_disconnected_once(self) -> None:
+        if not self._connected_interval_active and not self._force_disconnected_dispatch:
+            return
+
+        self._connected_interval_active = False
+        self._connected_interval_disconnected = True
+        self._force_disconnected_dispatch = False
+        payload: NodeDisconnectedEventPayload = NodeDisconnectedEventPayload(node=self.node)
+        self.dispatch("node_disconnected", payload)
+
+    @staticmethod
+    def _append_error_chain(first_error: BaseException, appended_error: BaseException) -> None:
+        if first_error is appended_error:
+            return
+
+        visited: set[int] = set()
+        primary_chain_ids: set[int] = set()
+        current: BaseException = first_error
+
+        while True:
+            current_id = id(current)
+            if current_id in visited:
+                return
+
+            visited.add(current_id)
+            primary_chain_ids.add(current_id)
+            cause = current.__cause__
+
+            if cause is None:
+                appended_visited: set[int] = set()
+                appended_current: BaseException | None = appended_error
+                while appended_current is not None:
+                    appended_id = id(appended_current)
+                    if appended_id in primary_chain_ids:
+                        return
+                    if appended_id in appended_visited:
+                        break
+                    appended_visited.add(appended_id)
+                    appended_current = appended_current.__cause__
+
+                current.__cause__ = appended_error
+                return
+
+            if cause is appended_error:
+                return
+
+            current = cause
 
     @property
     def headers(self) -> dict[str, str]:
@@ -89,11 +158,8 @@ class Websocket:
             self.node._spotify_enabled = True
 
     async def connect(self) -> None:
-        if self.node._status is NodeStatus.CONNECTED:
-            # Node was previously connected...
-            # We can dispatch an event to say the node was disconnected...
-            payload: NodeDisconnectedEventPayload = NodeDisconnectedEventPayload(node=self.node)
-            self.dispatch("node_disconnected", payload)
+        reconnect_task = asyncio.current_task()
+        is_reconnect_task = reconnect_task is self.reconnect_task
 
         self.node._status = NodeStatus.CONNECTING
 
@@ -115,17 +181,19 @@ class Websocket:
         uri: str = f"{self.node.uri.removesuffix('/')}/v4/websocket"
         github: str = "https://github.com/PythonistaGuild/Wavelink/issues"
 
-        while True:
-            try:
-                self.socket = await session.ws_connect(url=uri, heartbeat=heartbeat, headers=self.headers)  # type: ignore
-            except Exception as e:
-                if isinstance(e, aiohttp.WSServerHandshakeError) and e.status == 401:
-                    await self.cleanup()
-                    raise AuthorizationFailedException from e
-                elif isinstance(e, aiohttp.WSServerHandshakeError) and e.status == 404:
-                    await self.cleanup()
-                    raise NodeException from e
-                else:
+        try:
+            while True:
+                try:
+                    self.socket = await session.ws_connect(url=uri, heartbeat=heartbeat, headers=self.headers)  # type: ignore
+                except Exception as e:
+                    if isinstance(e, aiohttp.WSServerHandshakeError) and e.status in (401, 404):
+                        if is_reconnect_task and self._connected_interval_active:
+                            self._force_disconnected_dispatch = True
+                        await self.cleanup()
+                        if e.status == 401:
+                            raise AuthorizationFailedException from e
+                        raise NodeException from e
+
                     logger.warning(
                         (
                             'An unexpected error occurred while connecting %r to Lavalink: "%s"\n'
@@ -136,30 +204,38 @@ class Websocket:
                         github,
                     )
 
-            if self.is_connected():
-                self.keep_alive_task = asyncio.create_task(self.keep_alive())
-                break
+                if self.is_connected():
+                    keep_alive_task = asyncio.create_task(self.keep_alive())
+                    keep_alive_task.add_done_callback(
+                        lambda task: self._observe_task_result(task, role="keep-alive", node=self.node)
+                    )
+                    self.keep_alive_task = keep_alive_task
+                    break
 
-            if retries == 0:
-                logger.warning(
-                    (
-                        '%r was unable to successfully connect/reconnect to Lavalink after "%s" connection attempt. '
-                        "This Node has exhausted the retry count."
-                    ),
-                    self.node,
-                    retries + 1,
-                )
+                if retries == 0:
+                    logger.warning(
+                        (
+                            "%r was unable to successfully connect/reconnect to Lavalink after "
+                            '"%s" connection attempt. '
+                            "This Node has exhausted the retry count."
+                        ),
+                        self.node,
+                        retries + 1,
+                    )
 
-                await self.cleanup()
-                break
+                    await self.cleanup()
+                    break
 
-            if retries:
-                retries -= 1
+                if retries:
+                    retries -= 1
 
-            delay: float = self.backoff.calculate()
-            logger.info('%r retrying websocket connection in "%s" seconds.', self.node, delay)
+                delay: float = self.backoff.calculate()
+                logger.info('%r retrying websocket connection in "%s" seconds.', self.node, delay)
 
-            await asyncio.sleep(delay)
+                await asyncio.sleep(delay)
+        finally:
+            if is_reconnect_task and self.reconnect_task is reconnect_task:
+                self.reconnect_task = None
 
     async def keep_alive(self) -> None:
         assert self.socket is not None
@@ -171,7 +247,10 @@ class Websocket:
                 aiohttp.WSMsgType.CLOSED,
                 aiohttp.WSMsgType.CLOSING,
             ):
-                asyncio.create_task(self.connect())
+                self._dispatch_disconnected_once()
+                reconnect_task = asyncio.create_task(self.connect())
+                reconnect_task.add_done_callback(self._retire_reconnect_task)
+                self.reconnect_task = reconnect_task
                 break
 
             if message.data is None:  # pyright: ignore[reportUnknownMemberType]
@@ -186,6 +265,8 @@ class Websocket:
 
                 self.node._status = NodeStatus.CONNECTED
                 self.node._session_id = session_id
+                self._connected_interval_active = True
+                self._connected_interval_disconnected = False
 
                 await self._update_node()
 
@@ -293,25 +374,78 @@ class Websocket:
         logger.debug("%r dispatched the event 'on_wavelink_%s'", self.node, event)
 
     async def cleanup(self) -> None:
-        if self.keep_alive_task:
-            try:
-                self.keep_alive_task.cancel()
-            except Exception:
-                pass
+        initiator_task = asyncio.current_task()
+        cleanup_task = self._cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(self._run_cleanup(initiator_task))
+            self._cleanup_task = cleanup_task
 
-        if self.socket:
+        outcome = await asyncio.shield(cleanup_task)
+        await self._drain_cleanup_snapshot()
+
+        if outcome.first_error is not None:
+            raise outcome.first_error
+
+    async def _run_cleanup(self, initiator_task: asyncio.Task[Any] | None) -> _CleanupOutcome:
+        first_error: BaseException | None = None
+        dispatch_error: BaseException | None = None
+        current_task = asyncio.current_task()
+        owned_tasks = tuple(task for task in (self.keep_alive_task, self.reconnect_task) if task is not None)
+        self._cleanup_snapshot = owned_tasks
+        primary_socket = self.socket
+
+        for task in owned_tasks:
+            if task is current_task or task is initiator_task:
+                continue
+
             try:
-                await self.socket.close()
-            except Exception:
-                pass
+                task.cancel()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if primary_socket is not None:
+            try:
+                await primary_socket.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
 
         self.node._status = NodeStatus.DISCONNECTED
         self.node._session_id = None
         self.node._players = {}
-
         self.node._websocket = None
 
-        payload: NodeDisconnectedEventPayload = NodeDisconnectedEventPayload(node=self.node)
-        self.dispatch("node_disconnected", payload)
+        try:
+            self._dispatch_disconnected_once()
+        except BaseException as exc:
+            dispatch_error = exc
+
+        if first_error is None:
+            first_error = dispatch_error
+        elif dispatch_error is not None:
+            self._append_error_chain(first_error, dispatch_error)
 
         logger.debug("Successfully cleaned up the websocket for %r", self.node)
+        return _CleanupOutcome(
+            primary_socket=primary_socket,
+            primary_socket_disposed=primary_socket.closed if primary_socket is not None else True,
+            first_error=first_error,
+        )
+
+    async def _drain_cleanup_snapshot(self) -> None:
+        current_task = asyncio.current_task()
+        pending = tuple(task for task in self._cleanup_snapshot if task is not current_task and not task.done())
+        if not pending:
+            return
+
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupOutcome:
+    primary_socket: Any | None
+    primary_socket_disposed: bool
+    first_error: BaseException | None
