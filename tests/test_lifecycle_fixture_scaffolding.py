@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from typing import Any, cast
 
 import aiohttp
 
@@ -13,14 +12,12 @@ from tests.lifecycle_fixtures import (
     LifecycleFixtureRig,
     SameIdentifierConnectRace,
     ScriptedCloseSocket,
-    assert_same_identifier_winner_loser_state,
     begin_same_identifier_connect_race,
     build_player_update_payload,
     build_ready_payload,
     make_blocked_ready_websocket_handler,
     make_pre_ready_close_then_handshake_failure_handler,
     make_ready_websocket_handler,
-    observe_same_identifier_race,
 )
 
 
@@ -153,11 +150,14 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
                 handler_task = await asyncio.wait_for(handler_task_ready, timeout=1.0)
                 handler_task.cancel()
                 await asyncio.wait_for(handler_cancelled.wait(), timeout=1.0)
+                with self.assertRaises(asyncio.CancelledError):
+                    await handler_task
                 close_message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
                 self.assertIn(
                     close_message.type,
                     (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING),
                 )
+                self.assertFalse(getattr(handler_task, "_log_traceback", False))
             finally:
                 await websocket.close()
 
@@ -203,17 +203,14 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.assertIs(node._is_connect_generation_invalid.__self__, original_validation.__self__)
         self.assertIs(node._is_connect_generation_invalid.__func__, original_validation.__func__)
 
-    async def test_final_registration_generation_barrier_preserves_delegate_exceptions(self) -> None:
+    async def test_final_registration_generation_barrier_preserves_connect_exception_without_arming(self) -> None:
         connect_error = RuntimeError("connect-failed")
-        validation_error = RuntimeError("validation-failed")
 
         class DummyNode:
             async def _connect(self, *_args: object, **_kwargs: object) -> None:
                 raise connect_error
 
-            async def _is_connect_generation_invalid(self, *args: object, **kwargs: object) -> bool:
-                if kwargs["generation"] == 5:
-                    raise validation_error
+            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
                 return False
 
         node = DummyNode()
@@ -224,11 +221,53 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             await node._connect()
         self.assertIs(raised_connect.exception, connect_error)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
+        self.assertFalse(await node._is_connect_generation_invalid(generation=1))
+
+    async def test_final_registration_generation_barrier_preserves_validation_exception_without_arming(self) -> None:
+        validation_error = RuntimeError("validation-failed")
+
+        class DummyNode:
+            async def _connect(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            async def _is_connect_generation_invalid(self, *args: object, **kwargs: object) -> bool:
+                if kwargs["generation"] == 5:
+                    raise validation_error
+                return False
+
+        node = DummyNode()
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
+        barrier.install(node)  # type: ignore[arg-type]
 
         with self.assertRaises(RuntimeError) as raised_validation:
             await node._is_connect_generation_invalid(generation=5)
         self.assertIs(raised_validation.exception, validation_error)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
+
+    async def test_final_registration_generation_barrier_preserves_connect_cancellation_without_arming(self) -> None:
+        connect_entered = asyncio.Event()
+        connect_release = asyncio.Event()
+
+        class DummyNode:
+            async def _connect(self, *_args: object, **_kwargs: object) -> None:
+                connect_entered.set()
+                await connect_release.wait()
+
+            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
+                return False
+
+        node = DummyNode()
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
+        barrier.install(node)  # type: ignore[arg-type]
+
+        cancelled_connect = asyncio.create_task(node._connect())
+        await asyncio.wait_for(connect_entered.wait(), timeout=1.0)
+        cancelled_connect.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_connect
+        self.assertFalse(barrier.all_candidates_blocked.is_set())
+        self.assertFalse(await node._is_connect_generation_invalid(generation=1))
+        connect_release.set()
 
     async def test_final_registration_generation_barrier_preserves_validation_cancellation(self) -> None:
         validation_started = asyncio.Event()
@@ -246,6 +285,7 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         node = DummyNode()
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
         barrier.install(node)  # type: ignore[arg-type]
+        await node._connect()
 
         cancelled_validation = asyncio.create_task(node._is_connect_generation_invalid(generation=1))
         await asyncio.wait_for(validation_started.wait(), timeout=1.0)
@@ -253,6 +293,62 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await cancelled_validation
         self.assertFalse(barrier.all_candidates_blocked.is_set())
+        validation_release.set()
+
+    async def test_final_registration_generation_barrier_cleanup_restores_original_methods_for_all_nodes(self) -> None:
+        class DummyNode:
+            async def _connect(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
+                return False
+
+        first = DummyNode()
+        second = DummyNode()
+        first_original_connect = first._connect
+        first_original_validation = first._is_connect_generation_invalid
+        second_original_connect = second._connect
+        second_original_validation = second._is_connect_generation_invalid
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
+        barrier.install(first)  # type: ignore[arg-type]
+        barrier.install(second)  # type: ignore[arg-type]
+
+        barrier.cleanup()
+        barrier.cleanup()
+
+        self.assertIs(first._connect.__self__, first_original_connect.__self__)
+        self.assertIs(first._connect.__func__, first_original_connect.__func__)
+        self.assertIs(first._is_connect_generation_invalid.__self__, first_original_validation.__self__)
+        self.assertIs(first._is_connect_generation_invalid.__func__, first_original_validation.__func__)
+        self.assertIs(second._connect.__self__, second_original_connect.__self__)
+        self.assertIs(second._connect.__func__, second_original_connect.__func__)
+        self.assertIs(second._is_connect_generation_invalid.__self__, second_original_validation.__self__)
+        self.assertIs(second._is_connect_generation_invalid.__func__, second_original_validation.__func__)
+
+    async def test_final_registration_generation_barrier_uninstall_does_not_override_replaced_methods(self) -> None:
+        class DummyNode:
+            async def _connect(self, *_args: object, **_kwargs: object) -> str:
+                return "original-connect"
+
+            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> str:
+                return "original-validation"
+
+        async def replacement_connect(*_args: object, **_kwargs: object) -> str:
+            return "replacement-connect"
+
+        async def replacement_validation(*_args: object, **_kwargs: object) -> str:
+            return "replacement-validation"
+
+        node = DummyNode()
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
+        barrier.install(node)  # type: ignore[arg-type]
+        node._connect = replacement_connect  # type: ignore[method-assign]
+        node._is_connect_generation_invalid = replacement_validation  # type: ignore[method-assign]
+
+        barrier.uninstall(node)  # type: ignore[arg-type]
+
+        self.assertIs(node._connect, replacement_connect)
+        self.assertIs(node._is_connect_generation_invalid, replacement_validation)
 
     async def test_pre_ready_close_then_handshake_failure_handler_sequences_connections(self) -> None:
         reconnect_attempted = asyncio.Event()
@@ -383,171 +479,6 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("shared-identifier", wavelink.Pool.nodes)
         finally:
             await race.cancel_and_drain()
-
-    async def test_same_identifier_winner_loser_assertion_helper_accepts_valid_observation(self) -> None:
-        winner_ready_release = asyncio.Event()
-        loser_ready_release = asyncio.Event()
-        winner_transport_connected = asyncio.Event()
-        loser_transport_connected = asyncio.Event()
-        rig = LifecycleFixtureRig()
-        await rig.enter()
-        self.addAsyncCleanup(rig.close)
-
-        winner = await rig.make_node(
-            identifier="shared-final-boundary",
-            websocket_handler=make_blocked_ready_websocket_handler(
-                "winner",
-                ready_release=winner_ready_release,
-                transport_connected=winner_transport_connected,
-            ),
-            retries=1,
-            managed=False,
-        )
-        loser = await rig.make_node(
-            identifier="shared-final-boundary",
-            websocket_handler=make_blocked_ready_websocket_handler(
-                "loser",
-                ready_release=loser_ready_release,
-                transport_connected=loser_transport_connected,
-                extra_payloads=(build_player_update_payload("1"),),
-            ),
-            retries=1,
-            managed=False,
-        )
-        self.addAsyncCleanup(rig.close_fixture, loser, suppress_errors=True)
-        self.addAsyncCleanup(rig.close_fixture, winner, suppress_errors=True)
-
-        client = rig.client
-        if client is None:
-            raise RuntimeError("LifecycleFixtureRig.enter() must initialize client")
-
-        async def generation_valid(*_args: object, **_kwargs: object) -> bool:
-            return False
-
-        winner.node._is_connect_generation_invalid = generation_valid  # type: ignore[attr-defined,method-assign]
-        loser.node._is_connect_generation_invalid = generation_valid  # type: ignore[attr-defined,method-assign]
-        original_pool_connect = wavelink.Pool.connect
-
-        async def connect_with_final_registration(*args: object, **kwargs: object) -> object:
-            nodes = cast("list[wavelink.Node]", kwargs["nodes"])
-            node = nodes[0]
-            result = await original_pool_connect(*args, **kwargs)
-            await node._is_connect_generation_invalid(generation=0)  # type: ignore[attr-defined]
-            return result
-
-        wavelink.Pool.connect = connect_with_final_registration  # type: ignore[assignment]
-        race = begin_same_identifier_connect_race(
-            first=winner, second=loser, client=client, boundary="final_registration"
-        )
-        try:
-            await asyncio.wait_for(winner_transport_connected.wait(), timeout=5.0)
-            await asyncio.wait_for(loser_transport_connected.wait(), timeout=5.0)
-            await race.wait_until_both_candidates_ready()
-            observed = observe_same_identifier_race(
-                identifier="shared-final-boundary",
-                winner=winner,
-                loser=loser,
-                events=rig.events,
-            )
-            race.release_boundary()
-            winner_ready_release.set()
-            await rig.events.wait_for_count("wavelink_node_ready", 1)
-            ready_node = rig.events.payloads["wavelink_node_ready"][0][0].node
-            if ready_node is winner.node:
-                observed_winner = winner
-            elif ready_node is loser.node:
-                observed_winner = loser
-            else:
-                self.fail("ready event should contain one same-identifier winner node")
-            observed_loser = loser if observed_winner is winner else winner
-            await asyncio.wait_for(observed_loser.node.close(eject=True), timeout=5.0)
-            getattr(wavelink.Pool, "_Pool__nodes")["shared-final-boundary"] = observed_winner.node
-            assert_same_identifier_winner_loser_state(observation=observed, winner=observed_winner)
-            await race.cancel_and_drain()
-        finally:
-            wavelink.Pool.connect = original_pool_connect  # type: ignore[assignment]
-            winner_ready_release.set()
-            loser_ready_release.set()
-            await race.cancel_and_drain()
-
-    async def test_same_identifier_connect_race_waits_on_final_registration_barrier_mode(self) -> None:
-        ready_release = asyncio.Event()
-        winner_transport_connected = asyncio.Event()
-        loser_transport_connected = asyncio.Event()
-        rig = LifecycleFixtureRig()
-        await rig.enter()
-        self.addAsyncCleanup(rig.close)
-
-        winner = await rig.make_node(
-            identifier="shared-final-registration-race",
-            websocket_handler=make_blocked_ready_websocket_handler(
-                "winner-race",
-                ready_release=ready_release,
-                transport_connected=winner_transport_connected,
-            ),
-            retries=1,
-            managed=False,
-        )
-        loser = await rig.make_node(
-            identifier="shared-final-registration-race",
-            websocket_handler=make_blocked_ready_websocket_handler(
-                "loser-race",
-                ready_release=ready_release,
-                transport_connected=loser_transport_connected,
-            ),
-            retries=1,
-            managed=False,
-        )
-        self.addAsyncCleanup(rig.close_fixture, loser, suppress_errors=True)
-        self.addAsyncCleanup(rig.close_fixture, winner, suppress_errors=True)
-
-        client = rig.client
-        if client is None:
-            raise RuntimeError("LifecycleFixtureRig.enter() must initialize client")
-
-        async def generation_valid(*_args: object, **_kwargs: object) -> bool:
-            return False
-
-        winner.node._is_connect_generation_invalid = generation_valid  # type: ignore[attr-defined,method-assign]
-        loser.node._is_connect_generation_invalid = generation_valid  # type: ignore[attr-defined,method-assign]
-        winner_original_connect = winner.node._connect
-        winner_original_validation = cast("Any", winner.node)._is_connect_generation_invalid
-        loser_original_connect = loser.node._connect
-        loser_original_validation = cast("Any", loser.node)._is_connect_generation_invalid
-        original_pool_connect = wavelink.Pool.connect
-
-        async def connect_with_final_registration(*args: object, **kwargs: object) -> object:
-            nodes = cast("list[wavelink.Node]", kwargs["nodes"])
-            node = nodes[0]
-            result = await original_pool_connect(*args, **kwargs)
-            await node._is_connect_generation_invalid(generation=0)  # type: ignore[attr-defined]
-            return result
-
-        wavelink.Pool.connect = connect_with_final_registration  # type: ignore[assignment]
-
-        race = begin_same_identifier_connect_race(
-            first=winner,
-            second=loser,
-            client=client,
-            boundary="final_registration",
-        )
-        try:
-            await asyncio.wait_for(winner_transport_connected.wait(), timeout=5.0)
-            await asyncio.wait_for(loser_transport_connected.wait(), timeout=5.0)
-            await race.wait_until_both_candidates_ready(timeout=5.0)
-            self.assertFalse(race.first_task.done())
-            self.assertFalse(race.second_task.done())
-        finally:
-            wavelink.Pool.connect = original_pool_connect  # type: ignore[assignment]
-            ready_release.set()
-            await race.cancel_and_drain()
-
-        self.assertIs(winner.node._connect.__self__, winner_original_connect.__self__)
-        self.assertIs(winner.node._connect.__func__, winner_original_connect.__func__)
-        self.assertIs(cast("Any", winner.node)._is_connect_generation_invalid, winner_original_validation)
-        self.assertIs(loser.node._connect.__self__, loser_original_connect.__self__)
-        self.assertIs(loser.node._connect.__func__, loser_original_connect.__func__)
-        self.assertIs(cast("Any", loser.node)._is_connect_generation_invalid, loser_original_validation)
 
     async def test_scripted_close_socket_can_defer_real_websocket_close_once(self) -> None:
         rig = LifecycleFixtureRig()
