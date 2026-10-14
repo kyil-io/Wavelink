@@ -621,16 +621,13 @@ class Node:
             task.cancel()
             owned_tasks.append(task)
 
-        for task in owned_tasks:
-            if task.done():
-                continue
-            try:
-                await task
-            except asyncio.CancelledError:
-                continue
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
+        if owned_tasks:
+            settled_tasks = await asyncio.gather(*owned_tasks, return_exceptions=True)
+            for settled in settled_tasks:
+                if isinstance(settled, asyncio.CancelledError):
+                    continue
+                if isinstance(settled, BaseException) and first_error is None:
+                    first_error = settled
 
         if self._websocket is websocket:
             self._status = NodeStatus.DISCONNECTED
