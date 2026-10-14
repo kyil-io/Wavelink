@@ -8,14 +8,19 @@ import aiohttp
 import wavelink
 from tests.lifecycle_fixtures import (
     ConnectReturnGate,
+    FinalRegistrationGenerationBarrier,
     LifecycleFixtureRig,
     SameIdentifierConnectRace,
+    SameIdentifierRaceObservation,
     ScriptedCloseSocket,
+    assert_same_identifier_winner_loser_state,
     begin_same_identifier_connect_race,
     build_player_update_payload,
     build_ready_payload,
+    make_blocked_ready_websocket_handler,
     make_pre_ready_close_then_handshake_failure_handler,
     make_ready_websocket_handler,
+    observe_same_identifier_race,
 )
 
 
@@ -55,6 +60,91 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first, {"op": "ready", "resumed": False, "sessionId": "ready-handler-1"})
             self.assertEqual(second["op"], "playerUpdate")
             await websocket.close()
+
+    async def test_blocked_ready_websocket_handler_waits_for_release_before_sending_ready(self) -> None:
+        ready_release = asyncio.Event()
+        transport_connected = asyncio.Event()
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        fixture = await rig.make_node(
+            identifier="handler-blocked-ready",
+            websocket_handler=make_blocked_ready_websocket_handler(
+                "blocked-ready",
+                ready_release=ready_release,
+                transport_connected=transport_connected,
+            ),
+            managed=False,
+        )
+        self.addAsyncCleanup(rig.close_fixture, fixture, suppress_errors=True)
+
+        async with aiohttp.ClientSession() as session:
+            websocket = await session.ws_connect(f"{fixture.server.uri}/v4/websocket")
+            try:
+                await asyncio.wait_for(transport_connected.wait(), timeout=1.0)
+                receive_task = asyncio.create_task(websocket.receive())
+                self.assertFalse(receive_task.done())
+                ready_release.set()
+                ready_message = await asyncio.wait_for(receive_task, timeout=1.0)
+                self.assertEqual(ready_message.json(), {"op": "ready", "resumed": False, "sessionId": "blocked-ready"})
+            finally:
+                await websocket.close()
+
+    async def test_final_registration_generation_barrier_blocks_once_after_connect_and_delegates_result(self) -> None:
+        class DummyNode:
+            def __init__(self) -> None:
+                self.connect_calls = 0
+                self.validation_calls = 0
+
+            async def _connect(self, *args: object, **kwargs: object) -> None:
+                self.connect_calls += 1
+
+            async def _is_connect_generation_invalid(self, *args: object, **kwargs: object) -> bool:
+                self.validation_calls += 1
+                return bool(kwargs["generation"] == 99)
+
+        node = DummyNode()
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
+        barrier.install(node)  # type: ignore[arg-type]
+
+        self.assertFalse(await node._is_connect_generation_invalid(generation=1))
+        await node._connect(client=None, generation=1)
+        blocked_validation = asyncio.create_task(node._is_connect_generation_invalid(generation=1))
+        await asyncio.wait_for(barrier.all_candidates_blocked.wait(), timeout=1.0)
+        self.assertFalse(blocked_validation.done())
+        barrier.release()
+        self.assertFalse(await asyncio.wait_for(blocked_validation, timeout=1.0))
+        self.assertTrue(await node._is_connect_generation_invalid(generation=99))
+        self.assertEqual(node.connect_calls, 1)
+        self.assertEqual(node.validation_calls, 3)
+
+    async def test_final_registration_generation_barrier_preserves_delegate_exceptions(self) -> None:
+        connect_error = RuntimeError("connect-failed")
+        validation_error = RuntimeError("validation-failed")
+
+        class DummyNode:
+            async def _connect(self, *_args: object, **_kwargs: object) -> None:
+                raise connect_error
+
+            async def _is_connect_generation_invalid(self, *args: object, **kwargs: object) -> bool:
+                if kwargs["generation"] == 5:
+                    raise validation_error
+                return False
+
+        node = DummyNode()
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
+        barrier.install(node)  # type: ignore[arg-type]
+
+        with self.assertRaises(RuntimeError) as raised_connect:
+            await node._connect()
+        self.assertIs(raised_connect.exception, connect_error)
+        self.assertFalse(barrier.all_candidates_blocked.is_set())
+
+        with self.assertRaises(RuntimeError) as raised_validation:
+            await node._is_connect_generation_invalid(generation=5)
+        self.assertIs(raised_validation.exception, validation_error)
+        self.assertFalse(barrier.all_candidates_blocked.is_set())
 
     async def test_pre_ready_close_then_handshake_failure_handler_sequences_connections(self) -> None:
         reconnect_attempted = asyncio.Event()
@@ -185,6 +275,94 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("shared-identifier", wavelink.Pool.nodes)
         finally:
             await race.cancel_and_drain()
+
+    async def test_same_identifier_winner_loser_assertion_helper_accepts_valid_observation(self) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        winner = await rig.make_node(
+            identifier="shared-final-boundary",
+            websocket_handler=make_ready_websocket_handler("winner"),
+            retries=1,
+            managed=False,
+        )
+        loser = await rig.make_node(
+            identifier="shared-final-boundary",
+            websocket_handler=make_ready_websocket_handler("loser"),
+            retries=1,
+            managed=False,
+        )
+        self.addAsyncCleanup(rig.close_fixture, loser, suppress_errors=True)
+        self.addAsyncCleanup(rig.close_fixture, winner, suppress_errors=True)
+
+        client = rig.client
+        if client is None:
+            raise RuntimeError("LifecycleFixtureRig.enter() must initialize client")
+        race = begin_same_identifier_connect_race(
+            first=winner,
+            second=loser,
+            client=client,
+        )
+        try:
+            await race.wait_until_both_candidates_ready()
+            race.release_first()
+            race.release_second()
+            await race.settle()
+
+            observed = observe_same_identifier_race(
+                identifier="shared-final-boundary",
+                winner=winner,
+                loser=loser,
+                events=rig.events,
+            )
+            self.assertEqual(
+                observed.ready_event_nodes,
+                tuple(payload[0].node for payload in rig.events.payloads["wavelink_node_ready"]),
+            )
+            self.assertEqual(observed.loser_player_update_count, 0)
+            self.assertFalse(observed.winner_session_closed or observed.loser_session_closed)
+
+            synthetic_observation = SameIdentifierRaceObservation(
+                registered_node=winner.node,
+                winner_raw_socket=winner.session_spy.latest_raw_websocket,
+                loser_raw_socket=loser.session_spy.latest_raw_websocket,
+                open_raw_socket_count=1,
+                loser_lifecycle_socket_matches_raw=True,
+                loser_socket_closed=True,
+                loser_tasks_settled=True,
+                ready_event_nodes=(winner.node,),
+                loser_player_update_count=0,
+                winner_session_closed=False,
+                loser_session_closed=False,
+            )
+            assert_same_identifier_winner_loser_state(observation=synthetic_observation, winner=winner)
+        finally:
+            await race.cancel_and_drain()
+
+    async def test_same_identifier_connect_race_waits_on_final_registration_barrier_mode(self) -> None:
+        boundary = FinalRegistrationGenerationBarrier(candidate_count=2)
+
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        first_task = asyncio.create_task(wait_forever())
+        second_task = asyncio.create_task(wait_forever())
+        race = SameIdentifierConnectRace(
+            first_gate=None,
+            second_gate=None,
+            first_task=first_task,
+            second_task=second_task,
+            final_registration_barrier=boundary,
+        )
+        waiter = asyncio.create_task(race.wait_until_both_candidates_ready(timeout=1.0))
+        self.assertFalse(waiter.done())
+        boundary.all_candidates_blocked.set()
+        await asyncio.wait_for(waiter, timeout=1.0)
+
+        await race.cancel_and_drain()
+        self.assertTrue(first_task.done())
+        self.assertTrue(second_task.done())
 
     async def test_scripted_close_socket_can_defer_real_websocket_close_once(self) -> None:
         rig = LifecycleFixtureRig()
