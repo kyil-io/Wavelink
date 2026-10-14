@@ -7,7 +7,7 @@ import socket
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 import aiohttp
 import discord
@@ -15,7 +15,7 @@ from aiohttp import web
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 
     import wavelink
 
@@ -30,6 +30,15 @@ INFO_PAYLOAD: dict[str, object] = {
     "filters": [],
     "plugins": [],
 }
+
+
+class ClientWebSocketLike(Protocol):
+    async def close(self, *args: Any, **kwargs: Any) -> bool: ...
+
+    async def receive(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    @property
+    def closed(self) -> bool: ...
 
 
 def install_offline_client_user(client: discord.Client) -> None:
@@ -57,7 +66,7 @@ class SessionSpy:
         self.ws_connect_calls = 0
         self.call_events: list[tuple[int, bool]] = []
         self.latest_wrapper_ref: weakref.ReferenceType[_TransparentClientWebSocket] | None = None
-        self.latest_raw_websocket: aiohttp.ClientWebSocketResponse[bool] | None = None
+        self.latest_raw_websocket: ClientWebSocketLike | None = None
         self.boundary_calls = 0
         self.boundary_marked = False
         self.post_boundary_call = asyncio.Event()
@@ -168,7 +177,7 @@ class ConnectCancelGate:
 
 
 class _TransparentClientWebSocket:
-    def __init__(self, websocket: aiohttp.ClientWebSocketResponse[bool], session_spy: SessionSpy) -> None:
+    def __init__(self, websocket: ClientWebSocketLike, session_spy: SessionSpy) -> None:
         self._websocket = websocket
         self._session_spy = session_spy
 
@@ -194,9 +203,7 @@ class _TransparentClientWebSocket:
 
 
 class ScriptedCloseSocket:
-    def __init__(
-        self, websocket: aiohttp.ClientWebSocketResponse[bool], *, close_without_closing_attempts: int
-    ) -> None:
+    def __init__(self, websocket: ClientWebSocketLike, *, close_without_closing_attempts: int) -> None:
         self._websocket = websocket
         self._remaining_close_without_closing_attempts = close_without_closing_attempts
         self.close_calls = 0
@@ -262,6 +269,70 @@ def make_ready_websocket_handler(
     async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
         websocket = web.WebSocketResponse()
         await websocket.prepare(request)
+        ready_session_id = f"{session_id}-{number}" if include_connection_number else session_id
+        await websocket.send_json(build_ready_payload(ready_session_id))
+        for payload in extra_payloads:
+            await websocket.send_json(payload)
+        return await wait_for_client_close(websocket)
+
+    return websocket_handler
+
+
+def make_blocked_ready_websocket_handler(
+    session_id: str,
+    *,
+    ready_release: asyncio.Event,
+    transport_connected: asyncio.Event | None = None,
+    client_close_won: asyncio.Event | None = None,
+    handler_cancelled_before_release: asyncio.Event | None = None,
+    handler_task_ready: asyncio.Future[asyncio.Task[Any]] | None = None,
+    include_connection_number: bool = False,
+    extra_payloads: Sequence[dict[str, Any]] = (),
+) -> Callable[[web.Request, int], Awaitable[web.StreamResponse]]:
+    async def cancel_and_drain(task: asyncio.Task[Any]) -> None:
+        if task.done():
+            with contextlib.suppress(BaseException):
+                task.result()
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        if transport_connected is not None:
+            transport_connected.set()
+        if handler_task_ready is not None and not handler_task_ready.done():
+            handler_task_ready.set_result(cast("asyncio.Task[Any]", asyncio.current_task()))
+        release_waiter = asyncio.create_task(ready_release.wait())
+        client_close_waiter = asyncio.create_task(wait_for_client_close(websocket))
+
+        try:
+            done, pending = await asyncio.wait(
+                (release_waiter, client_close_waiter),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            if handler_cancelled_before_release is not None and not ready_release.is_set():
+                handler_cancelled_before_release.set()
+            await cancel_and_drain(release_waiter)
+            await cancel_and_drain(client_close_waiter)
+            await websocket.close()
+            raise
+
+        if client_close_waiter in done:
+            if client_close_won is not None:
+                client_close_won.set()
+            for waiter in pending:
+                await cancel_and_drain(waiter)
+            await websocket.close()
+            return websocket
+
+        for waiter in pending:
+            await cancel_and_drain(waiter)
+        if websocket.closed:
+            return websocket
         ready_session_id = f"{session_id}-{number}" if include_connection_number else session_id
         await websocket.send_json(build_ready_payload(ready_session_id))
         for payload in extra_payloads:
@@ -420,6 +491,99 @@ class CloseJoinBarrier:
         node.close = close_with_join_boundary  # type: ignore[method-assign]
 
 
+class FinalRegistrationGenerationBarrier:
+    """One-shot rendezvous barrier for connect/validation wrapper pairs.
+
+    Callers must allocate a unique candidate token per wrapper pair via
+    :meth:`create_candidate_token` and reuse that exact token object for both
+    ``connect_then_arm`` and ``delegated_validation_then_block``.
+
+    This prevents key collisions when distinct nodes share identifiers.
+    """
+
+    def __init__(self, *, candidate_count: int) -> None:
+        self._candidate_count = candidate_count
+        self._entered_count = 0
+        self._rendezvous_completed = False
+        self._lock = asyncio.Lock()
+        self._release = asyncio.Event()
+        self.all_candidates_blocked = asyncio.Event()
+        self._gate_armed_by_candidate: dict[_BarrierCandidateToken, bool] = {}
+
+    def create_candidate_token(self) -> _BarrierCandidateToken:
+        """Create a unique opaque token for a connect/validation wrapper pair."""
+        return _BarrierCandidateToken()
+
+    def release(self) -> None:
+        self._release.set()
+
+    def connect_then_arm(
+        self,
+        *,
+        candidate_token: object,
+        connect: Callable[..., Coroutine[Any, Any, _ConnectResultT]],
+    ) -> Callable[..., Coroutine[Any, Any, _ConnectResultT]]:
+        resolved_token = self._require_candidate_token(candidate_token)
+
+        async def wrapped_connect(*args: Any, **kwargs: Any) -> _ConnectResultT:
+            result = await connect(*args, **kwargs)
+            self._gate_armed_by_candidate[resolved_token] = True
+            return result
+
+        return wrapped_connect
+
+    def delegated_validation_then_block(
+        self,
+        *,
+        candidate_token: object,
+        validate: Callable[..., Coroutine[Any, Any, _ValidationResultT]],
+    ) -> Callable[..., Coroutine[Any, Any, _ValidationResultT]]:
+        resolved_token = self._require_candidate_token(candidate_token)
+
+        async def wrapped_validation(*args: Any, **kwargs: Any) -> _ValidationResultT:
+            validation_result = await validate(*args, **kwargs)
+            if self._gate_armed_by_candidate.pop(resolved_token, False):
+                entered = False
+                try:
+                    async with self._lock:
+                        self._entered_count += 1
+                        entered = True
+                        if self._entered_count >= self._candidate_count:
+                            self._rendezvous_completed = True
+                            self.all_candidates_blocked.set()
+                    await self._release.wait()
+                finally:
+                    if entered:
+                        async with self._lock:
+                            self._entered_count = max(0, self._entered_count - 1)
+                            if (
+                                not self._rendezvous_completed
+                                and self._entered_count < self._candidate_count
+                                and self.all_candidates_blocked.is_set()
+                            ):
+                                self.all_candidates_blocked.clear()
+            return validation_result
+
+        return wrapped_validation
+
+    @staticmethod
+    def _require_candidate_token(candidate_token: object) -> _BarrierCandidateToken:
+        if not isinstance(candidate_token, _BarrierCandidateToken):
+            raise TypeError(
+                "FinalRegistrationGenerationBarrier candidate_token must come from "
+                "create_candidate_token() and be reused for connect/validation wrappers."
+            )
+        return candidate_token
+
+
+_ConnectResultT = TypeVar("_ConnectResultT")
+_ValidationResultT = TypeVar("_ValidationResultT")
+
+
+class _BarrierCandidateToken:
+    __slots__ = ()
+
+
 @dataclass
 class SameIdentifierConnectRace:
     first_gate: ConnectReturnGate
@@ -437,13 +601,16 @@ class SameIdentifierConnectRace:
     def release_second(self) -> None:
         self.second_gate.release()
 
+    def release_boundary(self) -> None:
+        self.first_gate.release()
+        self.second_gate.release()
+
     async def settle(self, *, timeout: float = 5.0) -> None:
         await asyncio.wait_for(self.first_task, timeout=timeout)
         await asyncio.wait_for(self.second_task, timeout=timeout)
 
     async def cancel_and_drain(self, *, timeout: float = 5.0) -> None:
-        self.first_gate.release()
-        self.second_gate.release()
+        self.release_boundary()
         tasks = (self.first_task, self.second_task)
         for task in tasks:
             if task.done():
@@ -456,7 +623,10 @@ class SameIdentifierConnectRace:
 
 
 def begin_same_identifier_connect_race(
-    *, first: FixtureNode, second: FixtureNode, client: discord.Client
+    *,
+    first: FixtureNode,
+    second: FixtureNode,
+    client: discord.Client,
 ) -> SameIdentifierConnectRace:
     import wavelink
 
@@ -464,6 +634,7 @@ def begin_same_identifier_connect_race(
     second_gate = ConnectReturnGate()
     first.session_spy.connect_return_gate = first_gate
     second.session_spy.connect_return_gate = second_gate
+
     first_task = asyncio.create_task(wavelink.Pool.connect(nodes=[first.node], client=client))
     second_task = asyncio.create_task(wavelink.Pool.connect(nodes=[second.node], client=client))
     return SameIdentifierConnectRace(
