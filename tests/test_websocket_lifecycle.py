@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import unittest
-from typing import Any
+from typing import Any, TypeVar
 
-import aiohttp
 from aiohttp import web
 
 import wavelink
 from tests.lifecycle_fixtures import (
+    ClientWebSocketLike,
     ConnectReturnGate,
     FixtureNode,
     LifecycleFixtureRig,
@@ -24,13 +24,20 @@ from tests.lifecycle_fixtures import (
 from wavelink.websocket import Websocket
 
 
+_T = TypeVar("_T")
+
+
 class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
+    def _require_not_none(self, value: _T | None) -> _T:
+        assert value is not None
+        return value
+
     async def asyncSetUp(self) -> None:
         self.rig = LifecycleFixtureRig()
         await self.rig.enter()
         self.addAsyncCleanup(self._cleanup_assert_pool_empty)
         self.addAsyncCleanup(self.rig.close)
-        self.client = self.rig.client
+        self.client = self._require_not_none(self.rig.client)
         self.events = self.rig.events
 
     async def _cleanup_assert_pool_empty(self) -> None:
@@ -290,10 +297,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
             cleanup_owner = lifecycle._cleanup_task
             assert cleanup_owner is not None
             await asyncio.wait_for(cleanup_owner, timeout=5.0)
-            self.assertFalse(
-                cleanup_task.done(),
-                "cleanup caller should remain pending while draining cancelled reconnect snapshot task",
-            )
+            self.assertFalse(cleanup_task.done())
             self.assertIn(reconnect_task, lifecycle._cleanup_snapshot)
             self.assertFalse(reconnect_task.done())
             self.assertTrue(primary_socket.closed)
@@ -388,7 +392,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
             fixture.session_spy.close_gate = close_gate
             close_task = asyncio.create_task(fixture.node.close(eject=True))
             await asyncio.wait_for(close_gate.entered.wait(), timeout=5.0)
-            close_state = fixture.node._close_state
+            close_state = self._require_not_none(fixture.node._close_state)
             close_state_task = close_state.task
             self.assertFalse(close_state_task.cancelled())
             close_task.cancel()
@@ -399,14 +403,11 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(close_state_task, timeout=5.0)
             self.assertEqual(fixture.node.status, wavelink.NodeStatus.DISCONNECTED)
             self.assertTrue(close_state_task.done() and not close_state_task.cancelled())
-            self.assertNotIn(
-                fixture.node.identifier,
-                wavelink.Pool.nodes,
-                "a cancelled sole close(eject=True) waiter must still eject the exact node identity after settle",
-            )
+            self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
         finally:
             if close_state_task is not None and not close_state_task.done():
-                fixture.session_spy.close_gate.release()
+                active_close_gate = self._require_not_none(fixture.session_spy.close_gate)
+                active_close_gate.release()
                 await asyncio.wait_for(close_state_task, timeout=5.0)
             if close_task is not None and not close_task.done():
                 close_task.cancel()
@@ -425,30 +426,21 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
         obsolete_lifecycle: Any | None = None
         try:
             await asyncio.wait_for(connect_gate.entered.wait(), timeout=5.0)
-            obsolete_lifecycle = fixture.node._websocket
+            obsolete_lifecycle = self._require_not_none(fixture.node._websocket)
             self.assertIsNone(obsolete_lifecycle.socket, "connect gate must block before socket publication")
             await asyncio.wait_for(fixture.node.close(eject=True), timeout=5.0)
             self.assertEqual(fixture.node.status, wavelink.NodeStatus.DISCONNECTED)
             self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
             connect_gate.release()
             await asyncio.wait_for(connect_task, timeout=5.0)
-            late_socket = fixture.session_spy.latest_raw_websocket
-            self.assertIsNotNone(late_socket, "late obsolete connect must have produced a candidate socket")
-            assert late_socket is not None
+            late_socket = self._require_not_none(fixture.session_spy.latest_raw_websocket)
             self.assertTrue(late_socket.closed)
             keep_alive_task = obsolete_lifecycle.keep_alive_task
-            self.assertTrue(
-                keep_alive_task is None or keep_alive_task.done(),
-                "late obsolete keep-alive task must not remain live after terminal close",
-            )
+            self.assertTrue(keep_alive_task is None or keep_alive_task.done())
             self.assertNotIn(fixture.node.identifier, wavelink.Pool.nodes)
             self.assertEqual(fixture.node.status, wavelink.NodeStatus.DISCONNECTED)
             self.assertIsNone(fixture.node.session_id)
-            self.assertEqual(
-                self.events.counts["wavelink_node_ready"],
-                0,
-                "late obsolete connect must not revive the node with a ready event after terminal close",
-            )
+            self.assertEqual(self.events.counts["wavelink_node_ready"], 0)
         finally:
             connect_gate.release()
             if not connect_task.done():
@@ -493,7 +485,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
             with self.assertLogs("wavelink.node", level="ERROR") as logs:
                 close_waiter = asyncio.create_task(fixture.node.close(eject=True))
                 await asyncio.wait_for(close_gate.entered.wait(), timeout=5.0)
-                retained = fixture.node._close_state
+                retained = self._require_not_none(fixture.node._close_state)
                 self.assertFalse(retained.task.done())
                 close_waiter.cancel()
                 with self.assertRaises(asyncio.CancelledError):
@@ -516,9 +508,13 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_reconnect_handshake_failures_dispatch_once_and_consume_reconnect_task_exception(self) -> None:
         for status, expected_exception in ((401, wavelink.AuthorizationFailedException), (404, wavelink.NodeException)):
             with self.subTest(status=status, phase="initial-handshake"):
+
+                async def handshake_failure_handler(_request: web.Request, _number: int) -> web.StreamResponse:
+                    return web.Response(status=status)
+
                 fixture = await self._make_unmanaged_node(
                     identifier=f"initial-handshake-failure-{status}",
-                    websocket_handler=lambda _req, _num, s=status: web.Response(status=s),
+                    websocket_handler=handshake_failure_handler,
                     retries=1,
                 )
                 try:
@@ -531,6 +527,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                     await self._cleanup_unmanaged_fixture(fixture)
             with self.subTest(status=status, phase="reconnect-handshake"):
                 reconnect_attempted, reconnect_release = asyncio.Event(), asyncio.Event()
+
                 async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
                     if number == 1:
                         return await make_ready_websocket_handler(f"fail-{status}-ready")(request, number)
@@ -539,6 +536,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                         reconnect_attempted=reconnect_attempted,
                         reconnect_release=reconnect_release,
                     )(request, number)
+
                 fixture = await self._make_unmanaged_node(
                     identifier=f"reconnect-failure-{status}",
                     websocket_handler=websocket_handler,
@@ -614,6 +612,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
         try:
             await race.wait_until_both_candidates_ready()
             loser_lifecycle = loser.node._websocket
+            assert loser_lifecycle is not None
             race.release_first()
             await asyncio.wait_for(race.first_task, timeout=5.0)
             race.release_second()
@@ -622,10 +621,8 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
             self.assertIs(wavelink.Pool.nodes.get("shared-concurrent-node"), winner.node)
             self.assertIsNone(loser.node._websocket)
             self.assertTrue(loser_lifecycle.socket is not None and loser_lifecycle.socket.closed)
-            self.assertTrue(
-                (loser_lifecycle.keep_alive_task is None or loser_lifecycle.keep_alive_task.done())
-                and (loser_lifecycle.reconnect_task is None or loser_lifecycle.reconnect_task.done())
-            )
+            self.assertTrue(loser_lifecycle.keep_alive_task is None or loser_lifecycle.keep_alive_task.done())
+            self.assertTrue(loser_lifecycle.reconnect_task is None or loser_lifecycle.reconnect_task.done())
             self.assertFalse(winner.session_spy.real.closed or loser.session_spy.real.closed)
             self.assertEqual(self.events.counts["wavelink_player_update"], 0)
             self.assertIs(self.events.payloads["wavelink_node_ready"][0][0].node, winner.node)
@@ -684,8 +681,8 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                 close_gate = unresolved_socket = None
                 try:
                     await asyncio.wait_for(connect_gate.entered.wait(), timeout=5.0)
-                    wrapper_ref = fixture.session_spy.latest_wrapper_ref
-                    candidate_socket = wrapper_ref()
+                    wrapper_ref = self._require_not_none(fixture.session_spy.latest_wrapper_ref)
+                    candidate_socket = self._require_not_none(wrapper_ref())
                     if scenario == "close-without-closing":
                         candidate_socket._websocket = ScriptedCloseSocket(
                             candidate_socket._websocket, close_without_closing_attempts=1
@@ -709,7 +706,9 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                         fixture.node._retained_candidate_sockets == [unresolved_socket] and not unresolved_socket.closed
                     )
                     if scenario == "close-without-closing":
-                        self.assertEqual(unresolved_socket._websocket.close_calls, 1)
+                        scripted_socket = unresolved_socket._websocket
+                        assert isinstance(scripted_socket, ScriptedCloseSocket)
+                        self.assertEqual(scripted_socket.close_calls, 1)
                     with self.assertRaisesRegex(RuntimeError, "retained websocket candidate remains unresolved"):
                         await asyncio.wait_for(
                             wavelink.Pool.connect(nodes=[fixture.node], client=self.client), timeout=5.0
@@ -768,7 +767,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                         websocket_handler=make_ready_websocket_handler("pre-disposal-retained-failure"),
                         retries=1,
                     )
-                    raw_socket: aiohttp.ClientWebSocketResponse[bool] | None = None
+                    raw_socket: ClientWebSocketLike | None = None
                     try:
                         await asyncio.wait_for(
                             wavelink.Pool.connect(nodes=[fixture.node], client=self.client), timeout=5.0
