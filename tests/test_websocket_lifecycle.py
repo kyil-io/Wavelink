@@ -310,6 +310,50 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                 fixture.session_spy.ws_connect = original_ws_connect  # type: ignore[method-assign]
             await self._cleanup_unmanaged_fixture(fixture)
 
+    async def test_cleanup_snapshot_propagates_caller_cancellation_while_draining_owned_task(self) -> None:
+        fixture = await self._make_unmanaged_node(
+            identifier="cleanup-snapshot-caller-cancel",
+            websocket_handler=make_ready_websocket_handler("cleanup-snapshot-caller-cancel"),
+            retries=None,
+        )
+        drain_task: asyncio.Task[None] | None = None
+        owned_task: asyncio.Task[None] | None = None
+        owned_task_cancel_release = asyncio.Event()
+        owned_task_cancel_entered = asyncio.Event()
+        try:
+            lifecycle = await self._connect_node_and_get_lifecycle(fixture)
+            assert lifecycle is not None
+
+            async def cleanup_snapshot_owned_task() -> None:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    owned_task_cancel_entered.set()
+                    await owned_task_cancel_release.wait()
+                    raise
+
+            owned_task = asyncio.create_task(cleanup_snapshot_owned_task())
+            lifecycle._cleanup_snapshot = (owned_task,)
+            drain_task = asyncio.create_task(lifecycle._drain_cleanup_snapshot())
+            advance_loop = asyncio.Event()
+            asyncio.get_running_loop().call_soon(advance_loop.set)
+            await asyncio.wait_for(advance_loop.wait(), timeout=5.0)
+            drain_task.cancel()
+            await asyncio.wait_for(owned_task_cancel_entered.wait(), timeout=5.0)
+            self.assertFalse(owned_task.done())
+            owned_task_cancel_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(drain_task, timeout=5.0)
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(owned_task, timeout=5.0)
+            self.assertTrue(drain_task.cancelled())
+            self.assertTrue(owned_task.done() and owned_task.cancelled())
+        finally:
+            owned_task_cancel_release.set()
+            await self._await_task_if_pending(drain_task, cancel=True)
+            await self._await_task_if_pending(owned_task)
+            await self._cleanup_unmanaged_fixture(fixture)
+
     async def test_cleanup_from_websocket_owned_task_skips_initiator_and_avoids_self_await_deadlock(self) -> None:
         fixture = await self._make_unmanaged_node(
             identifier="owned-task-cleanup",
