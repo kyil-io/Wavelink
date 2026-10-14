@@ -1187,25 +1187,17 @@ class Pool:
                 )
             else:
                 existing = cls.__nodes.get(node.identifier)
-                if existing is not None and existing is not node:
-                    logger.error(
-                        "Unable to register %r because another node instance with identifier %r is active.",
-                        node,
-                        node.identifier,
-                    )
-                    websocket = node._websocket
-                    if websocket is not None:
-                        try:
-                            await node._retire_obsolete_connect_candidate(websocket=websocket)
-                        except BaseException as exc:
-                            node._retired_candidate_disposal_error = exc
-                            raise
-                    continue
-
-                if await node._is_connect_generation_invalid(generation=generation):
-                    logger.error("Unable to register %r due to obsolete generation %s.", node, generation)
-                    websocket = node._websocket
-                    if websocket is not None:
+                conflict = existing is not None and existing is not node
+                if conflict or await node._is_connect_generation_invalid(generation=generation):
+                    if conflict:
+                        logger.error(
+                            "Unable to register %r because another node instance with identifier %r is active.",
+                            node,
+                            node.identifier,
+                        )
+                    else:
+                        logger.error("Unable to register %r due to obsolete generation %s.", node, generation)
+                    if (websocket := node._websocket) is not None:
                         try:
                             await node._retire_obsolete_connect_candidate(websocket=websocket)
                         except BaseException as exc:
