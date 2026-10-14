@@ -524,23 +524,21 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                 try:
                     disconnected_before = self.events.counts["wavelink_node_disconnected"]
                     with contextlib.suppress(expected_exception):
-                        await asyncio.wait_for(
-                            wavelink.Pool.connect(nodes=[fixture.node], client=self.client), timeout=5.0
-                        )
-                    self.assertEqual(
-                        self.events.counts["wavelink_node_disconnected"] - disconnected_before,
-                        0,
-                        "initial handshake failure before ready must not dispatch disconnected",
-                    )
+                        connect = wavelink.Pool.connect(nodes=[fixture.node], client=self.client)
+                        await asyncio.wait_for(connect, timeout=5.0)
+                    self.assertEqual(self.events.counts["wavelink_node_disconnected"] - disconnected_before, 0)
                 finally:
                     await self._cleanup_unmanaged_fixture(fixture)
             with self.subTest(status=status, phase="reconnect-handshake"):
-
+                reconnect_attempted, reconnect_release = asyncio.Event(), asyncio.Event()
                 async def websocket_handler(request: web.Request, number: int) -> web.StreamResponse:
                     if number == 1:
                         return await make_ready_websocket_handler(f"fail-{status}-ready")(request, number)
-                    return web.Response(status=status)
-
+                    return await make_pre_ready_close_then_handshake_failure_handler(
+                        handshake_status=status,
+                        reconnect_attempted=reconnect_attempted,
+                        reconnect_release=reconnect_release,
+                    )(request, number)
                 fixture = await self._make_unmanaged_node(
                     identifier=f"reconnect-failure-{status}",
                     websocket_handler=websocket_handler,
@@ -553,9 +551,11 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                     fixture.session_spy.mark_boundary()
                     await asyncio.wait_for(lifecycle.socket.close(), timeout=5.0)
                     await asyncio.wait_for(fixture.session_spy.post_boundary_call.wait(), timeout=5.0)
+                    await asyncio.wait_for(reconnect_attempted.wait(), timeout=5.0)
                     reconnect_task = lifecycle.reconnect_task
-                    assert reconnect_task is not None
-                    await asyncio.wait({reconnect_task}, timeout=5.0)
+                    assert reconnect_task is not None and not reconnect_task.done()
+                    reconnect_release.set()
+                    await asyncio.wait_for(asyncio.wait({reconnect_task}), timeout=5.0)
                     await self.events.wait_for_count("wavelink_node_disconnected", disconnected_before + 1)
                     self.assertEqual(
                         self.events.counts["wavelink_node_disconnected"] - disconnected_before,
@@ -565,6 +565,7 @@ class TestWebsocketLifecycle(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(getattr(reconnect_task, "_exception", None), expected_exception)
                     self.assertFalse(getattr(reconnect_task, "_log_traceback", False))
                 finally:
+                    reconnect_release.set()
                     await self._cleanup_unmanaged_fixture(fixture)
 
     async def test_pre_ready_close_then_reconnect_handshake_failure_never_dispatches_disconnect(self) -> None:
