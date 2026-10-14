@@ -7,7 +7,7 @@ import socket
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 import aiohttp
 import discord
@@ -15,7 +15,7 @@ from aiohttp import web
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 
     import wavelink
 
@@ -499,52 +499,33 @@ class FinalRegistrationGenerationBarrier:
         self._lock = asyncio.Lock()
         self._release = asyncio.Event()
         self.all_candidates_blocked = asyncio.Event()
-        self._patched_nodes: dict[int, tuple[Any, Any, Any, Any, Any]] = {}
-        self._gate_armed_by_node: dict[int, bool] = {}
+        self._gate_armed_by_candidate: dict[object, bool] = {}
 
     def release(self) -> None:
         self._release.set()
 
-    def uninstall(self, node: wavelink.Node) -> None:
-        patch = self._patched_nodes.pop(id(node), None)
-        self._gate_armed_by_node.pop(id(node), None)
-        if patch is None:
-            return
-        original_connect, original_validation, wrapped_connect, wrapped_validation, patched_node = patch
-        if node is not patched_node:
-            return
-        if node._connect is wrapped_connect:
-            node._connect = original_connect  # type: ignore[method-assign]
-        current_validation = getattr(node, "_is_connect_generation_invalid", None)
-        if current_validation is wrapped_validation:
-            setattr(node, "_is_connect_generation_invalid", original_validation)
-
-    def cleanup(self) -> None:
-        for patch in tuple(self._patched_nodes.values()):
-            patched_node = patch[4]
-            self.uninstall(cast("wavelink.Node", patched_node))
-
-    def install(self, node: wavelink.Node) -> None:
-        if id(node) in self._patched_nodes:
-            return
-        if not hasattr(node, "_is_connect_generation_invalid"):
-            raise AttributeError("FinalRegistrationGenerationBarrier requires node._is_connect_generation_invalid")
-        original_connect = node._connect
-        original_is_connect_generation_invalid = cast(
-            "Callable[..., Awaitable[bool]]",
-            getattr(node, "_is_connect_generation_invalid"),
-        )
-        node_identifier = id(node)
-        self._gate_armed_by_node[node_identifier] = False
-
-        async def connect_then_arm(*args: Any, **kwargs: Any) -> Any:
-            result = await original_connect(*args, **kwargs)
-            self._gate_armed_by_node[node_identifier] = True
+    def connect_then_arm(
+        self,
+        *,
+        candidate: object,
+        connect: Callable[..., Coroutine[Any, Any, _ConnectResultT]],
+    ) -> Callable[..., Coroutine[Any, Any, _ConnectResultT]]:
+        async def wrapped_connect(*args: Any, **kwargs: Any) -> _ConnectResultT:
+            result = await connect(*args, **kwargs)
+            self._gate_armed_by_candidate[candidate] = True
             return result
 
-        async def block_after_final_generation_validation(*args: Any, **kwargs: Any) -> bool:
-            invalid = await original_is_connect_generation_invalid(*args, **kwargs)
-            if self._gate_armed_by_node.pop(node_identifier, False):
+        return wrapped_connect
+
+    def delegated_validation_then_block(
+        self,
+        *,
+        candidate: object,
+        validate: Callable[..., Coroutine[Any, Any, _ValidationResultT]],
+    ) -> Callable[..., Coroutine[Any, Any, _ValidationResultT]]:
+        async def wrapped_validation(*args: Any, **kwargs: Any) -> _ValidationResultT:
+            validation_result = await validate(*args, **kwargs)
+            if self._gate_armed_by_candidate.pop(candidate, False):
                 entered = False
                 try:
                     async with self._lock:
@@ -564,17 +545,13 @@ class FinalRegistrationGenerationBarrier:
                                 and self.all_candidates_blocked.is_set()
                             ):
                                 self.all_candidates_blocked.clear()
-            return invalid
+            return validation_result
 
-        node._connect = connect_then_arm  # type: ignore[method-assign]
-        setattr(node, "_is_connect_generation_invalid", block_after_final_generation_validation)
-        self._patched_nodes[node_identifier] = (
-            original_connect,
-            original_is_connect_generation_invalid,
-            connect_then_arm,
-            block_after_final_generation_validation,
-            node,
-        )
+        return wrapped_validation
+
+
+_ConnectResultT = TypeVar("_ConnectResultT")
+_ValidationResultT = TypeVar("_ValidationResultT")
 
 
 @dataclass

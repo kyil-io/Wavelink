@@ -81,6 +81,8 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.wait_for(transport_connected.wait(), timeout=1.0)
                 receive_task = asyncio.create_task(websocket.receive())
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(receive_task), timeout=0.05)
                 self.assertFalse(receive_task.done())
                 ready_release.set()
                 ready_message = await asyncio.wait_for(receive_task, timeout=1.0)
@@ -153,6 +155,8 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.wait_for(transport_connected.wait(), timeout=1.0)
                 first_receive = asyncio.create_task(websocket.receive())
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(first_receive), timeout=0.05)
                 self.assertFalse(first_receive.done())
 
                 ready_release.set()
@@ -261,97 +265,110 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
                 return validation_result
 
         node = DummyNode()
-        original_connect = node._connect
-        original_validation = node._is_connect_generation_invalid
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        barrier.install(node)  # type: ignore[arg-type]
+        connect = barrier.connect_then_arm(candidate="node-1", connect=node._connect)
+        validate = barrier.delegated_validation_then_block(
+            candidate="node-1", validate=node._is_connect_generation_invalid
+        )
 
-        self.assertIs(await node._is_connect_generation_invalid(generation=1), validation_result)
-        self.assertIs(await node._connect(client=None, generation=1), connect_result)
-        blocked_validation = asyncio.create_task(node._is_connect_generation_invalid(generation=2))
+        self.assertIs(await validate(generation=1), validation_result)
+        self.assertIs(await connect(client=None, generation=1), connect_result)
+        blocked_validation = asyncio.create_task(validate(generation=2))
         await asyncio.wait_for(barrier.all_candidates_blocked.wait(), timeout=1.0)
         self.assertFalse(blocked_validation.done())
         barrier.release()
         self.assertIs(await asyncio.wait_for(blocked_validation, timeout=1.0), validation_result)
-        self.assertTrue(await node._is_connect_generation_invalid(generation=99))
-        self.assertIs(await node._is_connect_generation_invalid(generation=2), validation_result)
+        self.assertTrue(await validate(generation=99))
+        self.assertIs(await validate(generation=2), validation_result)
         self.assertEqual(node.connect_calls, 1)
         self.assertEqual(node.validation_calls, 4)
-        barrier.uninstall(node)  # type: ignore[arg-type]
-        self.assertIs(node._connect.__self__, original_connect.__self__)
-        self.assertIs(node._connect.__func__, original_connect.__func__)
-        self.assertIs(node._is_connect_generation_invalid.__self__, original_validation.__self__)
-        self.assertIs(node._is_connect_generation_invalid.__func__, original_validation.__func__)
+
+    async def test_final_registration_generation_barrier_supports_real_node_connect_and_explicit_validation_callable(
+        self,
+    ) -> None:
+        rig = LifecycleFixtureRig()
+        await rig.enter()
+        self.addAsyncCleanup(rig.close)
+
+        fixture = await rig.make_node(
+            identifier="barrier-real-node",
+            websocket_handler=make_ready_websocket_handler("barrier-real-node"),
+            managed=False,
+        )
+        self.addAsyncCleanup(rig.close_fixture, fixture, suppress_errors=True)
+
+        validation_entered = asyncio.Event()
+
+        async def explicit_validation(*_args: object, **_kwargs: object) -> bool:
+            validation_entered.set()
+            return False
+
+        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
+        connect = barrier.connect_then_arm(candidate=fixture.node.identifier, connect=fixture.node._connect)
+        validate = barrier.delegated_validation_then_block(
+            candidate=fixture.node.identifier, validate=explicit_validation
+        )
+
+        await connect(client=rig.client)
+        blocked_validation = asyncio.create_task(validate(generation=1))
+        await asyncio.wait_for(validation_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(barrier.all_candidates_blocked.wait(), timeout=1.0)
+        self.assertFalse(blocked_validation.done())
+        barrier.release()
+        self.assertFalse(await asyncio.wait_for(blocked_validation, timeout=1.0))
+        self.assertFalse(await asyncio.wait_for(validate(generation=2), timeout=1.0))
+        await rig.close_fixture(fixture, suppress_errors=False)
 
     async def test_final_registration_generation_barrier_preserves_connect_exception_without_arming(self) -> None:
         connect_error = RuntimeError("connect-failed")
 
-        class DummyNode:
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                raise connect_error
+        async def failing_connect(*_args: object, **_kwargs: object) -> None:
+            raise connect_error
 
-            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
-                return False
+        async def validate(*_args: object, **_kwargs: object) -> bool:
+            return False
 
-        node = DummyNode()
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        barrier.install(node)  # type: ignore[arg-type]
+        connect = barrier.connect_then_arm(candidate="node-1", connect=failing_connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
 
         with self.assertRaises(RuntimeError) as raised_connect:
-            await node._connect()
+            await connect()
         self.assertIs(raised_connect.exception, connect_error)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
-        self.assertFalse(await node._is_connect_generation_invalid(generation=1))
-
-    async def test_final_registration_generation_barrier_preserves_validation_exception_without_arming(self) -> None:
-        validation_error = RuntimeError("validation-failed")
-
-        class DummyNode:
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                return None
-
-            async def _is_connect_generation_invalid(self, *args: object, **kwargs: object) -> bool:
-                if kwargs["generation"] == 5:
-                    raise validation_error
-                return False
-
-        node = DummyNode()
-        barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        barrier.install(node)  # type: ignore[arg-type]
-
-        with self.assertRaises(RuntimeError) as raised_validation:
-            await node._is_connect_generation_invalid(generation=5)
-        self.assertIs(raised_validation.exception, validation_error)
-        self.assertFalse(barrier.all_candidates_blocked.is_set())
+        self.assertFalse(await gated_validate(generation=1))
 
     async def test_final_registration_generation_barrier_candidate_count_two_rendezvous_is_deterministic(self) -> None:
-        class DummyNode:
-            def __init__(self) -> None:
-                self.validation_entered = asyncio.Event()
+        first_validation_entered = asyncio.Event()
+        second_validation_entered = asyncio.Event()
 
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                return None
+        async def connect(*_args: object, **_kwargs: object) -> None:
+            return None
 
-            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
-                self.validation_entered.set()
-                return False
+        async def first_validate(*_args: object, **_kwargs: object) -> bool:
+            first_validation_entered.set()
+            return False
 
-        first = DummyNode()
-        second = DummyNode()
+        async def second_validate(*_args: object, **_kwargs: object) -> bool:
+            second_validation_entered.set()
+            return False
+
         barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
-        barrier.install(first)  # type: ignore[arg-type]
-        barrier.install(second)  # type: ignore[arg-type]
+        first_connect = barrier.connect_then_arm(candidate="first", connect=connect)
+        second_connect = barrier.connect_then_arm(candidate="second", connect=connect)
+        first_gated_validate = barrier.delegated_validation_then_block(candidate="first", validate=first_validate)
+        second_gated_validate = barrier.delegated_validation_then_block(candidate="second", validate=second_validate)
 
-        await first._connect()
-        await second._connect()
+        await first_connect()
+        await second_connect()
 
-        first_blocked_validation = asyncio.create_task(first._is_connect_generation_invalid(generation=1))
-        await asyncio.wait_for(first.validation_entered.wait(), timeout=1.0)
+        first_blocked_validation = asyncio.create_task(first_gated_validate(generation=1))
+        await asyncio.wait_for(first_validation_entered.wait(), timeout=1.0)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
         self.assertFalse(first_blocked_validation.done())
 
-        second_blocked_validation = asyncio.create_task(second._is_connect_generation_invalid(generation=1))
-        await asyncio.wait_for(second.validation_entered.wait(), timeout=1.0)
+        second_blocked_validation = asyncio.create_task(second_gated_validate(generation=1))
+        await asyncio.wait_for(second_validation_entered.wait(), timeout=1.0)
         await asyncio.wait_for(barrier.all_candidates_blocked.wait(), timeout=1.0)
         self.assertFalse(second_blocked_validation.done())
 
@@ -360,28 +377,31 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await asyncio.wait_for(second_blocked_validation, timeout=1.0))
 
     async def test_final_registration_generation_barrier_cancelled_candidate_does_not_satisfy_rendezvous(self) -> None:
-        class DummyNode:
-            def __init__(self) -> None:
-                self.validation_entered = asyncio.Event()
+        first_validation_entered = asyncio.Event()
+        second_validation_entered = asyncio.Event()
 
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                return None
+        async def connect(*_args: object, **_kwargs: object) -> None:
+            return None
 
-            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
-                self.validation_entered.set()
-                return False
+        async def first_validate(*_args: object, **_kwargs: object) -> bool:
+            first_validation_entered.set()
+            return False
 
-        first = DummyNode()
-        second = DummyNode()
+        async def second_validate(*_args: object, **_kwargs: object) -> bool:
+            second_validation_entered.set()
+            return False
+
         barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
-        barrier.install(first)  # type: ignore[arg-type]
-        barrier.install(second)  # type: ignore[arg-type]
+        first_connect = barrier.connect_then_arm(candidate="first", connect=connect)
+        second_connect = barrier.connect_then_arm(candidate="second", connect=connect)
+        first_gated_validate = barrier.delegated_validation_then_block(candidate="first", validate=first_validate)
+        second_gated_validate = barrier.delegated_validation_then_block(candidate="second", validate=second_validate)
 
-        await first._connect()
-        await second._connect()
+        await first_connect()
+        await second_connect()
 
-        first_blocked_validation = asyncio.create_task(first._is_connect_generation_invalid(generation=1))
-        await asyncio.wait_for(first.validation_entered.wait(), timeout=1.0)
+        first_blocked_validation = asyncio.create_task(first_gated_validate(generation=1))
+        await asyncio.wait_for(first_validation_entered.wait(), timeout=1.0)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
         self.assertFalse(first_blocked_validation.done())
 
@@ -390,8 +410,8 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(first_blocked_validation, timeout=1.0)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
 
-        second_blocked_validation = asyncio.create_task(second._is_connect_generation_invalid(generation=1))
-        await asyncio.wait_for(second.validation_entered.wait(), timeout=1.0)
+        second_blocked_validation = asyncio.create_task(second_gated_validate(generation=1))
+        await asyncio.wait_for(second_validation_entered.wait(), timeout=1.0)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
         self.assertFalse(second_blocked_validation.done())
 
@@ -404,79 +424,76 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         validation_error = RuntimeError("validation-failed")
         successful_validation_entered = asyncio.Event()
 
-        class DummyNode:
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                return None
+        async def connect(*_args: object, **_kwargs: object) -> None:
+            return None
 
-            async def _is_connect_generation_invalid(self, *_args: object, **kwargs: object) -> bool:
-                if kwargs["generation"] == 10:
-                    raise validation_error
-                successful_validation_entered.set()
-                return False
+        async def validate(*_args: object, **kwargs: object) -> bool:
+            if kwargs["generation"] == 10:
+                raise validation_error
+            successful_validation_entered.set()
+            return False
 
-        node = DummyNode()
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        barrier.install(node)  # type: ignore[arg-type]
-        await node._connect()
+        gated_connect = barrier.connect_then_arm(candidate="node-1", connect=connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
+        await gated_connect()
 
         with self.assertRaises(RuntimeError) as raised_validation:
-            await node._is_connect_generation_invalid(generation=10)
+            await gated_validate(generation=10)
         self.assertIs(raised_validation.exception, validation_error)
         self.assertFalse(barrier.all_candidates_blocked.is_set())
 
-        blocked_successful_validation = asyncio.create_task(node._is_connect_generation_invalid(generation=11))
+        blocked_successful_validation = asyncio.create_task(gated_validate(generation=11))
         await asyncio.wait_for(successful_validation_entered.wait(), timeout=1.0)
         await asyncio.wait_for(barrier.all_candidates_blocked.wait(), timeout=1.0)
         self.assertFalse(blocked_successful_validation.done())
 
         barrier.release()
         self.assertFalse(await asyncio.wait_for(blocked_successful_validation, timeout=1.0))
-        self.assertFalse(await asyncio.wait_for(node._is_connect_generation_invalid(generation=12), timeout=1.0))
+        self.assertFalse(await asyncio.wait_for(gated_validate(generation=12), timeout=1.0))
 
     async def test_final_registration_generation_barrier_preserves_connect_cancellation_without_arming(self) -> None:
         connect_entered = asyncio.Event()
         connect_release = asyncio.Event()
 
-        class DummyNode:
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                connect_entered.set()
-                await connect_release.wait()
+        async def connect(*_args: object, **_kwargs: object) -> None:
+            connect_entered.set()
+            await connect_release.wait()
 
-            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
-                return False
+        async def validate(*_args: object, **_kwargs: object) -> bool:
+            return False
 
-        node = DummyNode()
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        barrier.install(node)  # type: ignore[arg-type]
+        gated_connect = barrier.connect_then_arm(candidate="node-1", connect=connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
 
-        cancelled_connect = asyncio.create_task(node._connect())
+        cancelled_connect = asyncio.create_task(gated_connect())
         await asyncio.wait_for(connect_entered.wait(), timeout=1.0)
         cancelled_connect.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await cancelled_connect
         self.assertFalse(barrier.all_candidates_blocked.is_set())
-        self.assertFalse(await node._is_connect_generation_invalid(generation=1))
+        self.assertFalse(await gated_validate(generation=1))
         connect_release.set()
 
     async def test_final_registration_generation_barrier_preserves_validation_cancellation(self) -> None:
         validation_started = asyncio.Event()
         validation_release = asyncio.Event()
 
-        class DummyNode:
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                return None
+        async def connect(*_args: object, **_kwargs: object) -> None:
+            return None
 
-            async def _is_connect_generation_invalid(self, *args: object, **kwargs: object) -> bool:
-                validation_started.set()
-                await validation_release.wait()
-                return False
+        async def validate(*_args: object, **_kwargs: object) -> bool:
+            validation_started.set()
+            await validation_release.wait()
+            return False
 
-        node = DummyNode()
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        barrier.install(node)  # type: ignore[arg-type]
-        await node._connect()
+        gated_connect = barrier.connect_then_arm(candidate="node-1", connect=connect)
+        gated_validate = barrier.delegated_validation_then_block(candidate="node-1", validate=validate)
+        await gated_connect()
 
-        cancelled_validation = asyncio.create_task(node._is_connect_generation_invalid(generation=1))
+        cancelled_validation = asyncio.create_task(gated_validate(generation=1))
         await asyncio.wait_for(validation_started.wait(), timeout=1.0)
         cancelled_validation.cancel()
         with self.assertRaises(asyncio.CancelledError):
@@ -484,37 +501,9 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(barrier.all_candidates_blocked.is_set())
         validation_release.set()
 
-    async def test_final_registration_generation_barrier_cleanup_restores_original_methods_for_all_nodes(self) -> None:
-        class DummyNode:
-            async def _connect(self, *_args: object, **_kwargs: object) -> None:
-                return None
-
-            async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> bool:
-                return False
-
-        first = DummyNode()
-        second = DummyNode()
-        first_original_connect = first._connect
-        first_original_validation = first._is_connect_generation_invalid
-        second_original_connect = second._connect
-        second_original_validation = second._is_connect_generation_invalid
-        barrier = FinalRegistrationGenerationBarrier(candidate_count=2)
-        barrier.install(first)  # type: ignore[arg-type]
-        barrier.install(second)  # type: ignore[arg-type]
-
-        barrier.cleanup()
-        barrier.cleanup()
-
-        self.assertIs(first._connect.__self__, first_original_connect.__self__)
-        self.assertIs(first._connect.__func__, first_original_connect.__func__)
-        self.assertIs(first._is_connect_generation_invalid.__self__, first_original_validation.__self__)
-        self.assertIs(first._is_connect_generation_invalid.__func__, first_original_validation.__func__)
-        self.assertIs(second._connect.__self__, second_original_connect.__self__)
-        self.assertIs(second._connect.__func__, second_original_connect.__func__)
-        self.assertIs(second._is_connect_generation_invalid.__self__, second_original_validation.__self__)
-        self.assertIs(second._is_connect_generation_invalid.__func__, second_original_validation.__func__)
-
-    async def test_final_registration_generation_barrier_uninstall_does_not_override_replaced_methods(self) -> None:
+    async def test_final_registration_generation_barrier_wrappers_allow_explicit_assignment_and_restoration(
+        self,
+    ) -> None:
         class DummyNode:
             async def _connect(self, *_args: object, **_kwargs: object) -> str:
                 return "original-connect"
@@ -522,22 +511,30 @@ class TestLifecycleFixtureScaffolding(unittest.IsolatedAsyncioTestCase):
             async def _is_connect_generation_invalid(self, *_args: object, **_kwargs: object) -> str:
                 return "original-validation"
 
-        async def replacement_connect(*_args: object, **_kwargs: object) -> str:
-            return "replacement-connect"
-
-        async def replacement_validation(*_args: object, **_kwargs: object) -> str:
-            return "replacement-validation"
-
         node = DummyNode()
+        original_connect = node._connect
+        original_validation = node._is_connect_generation_invalid
+
         barrier = FinalRegistrationGenerationBarrier(candidate_count=1)
-        barrier.install(node)  # type: ignore[arg-type]
-        node._connect = replacement_connect  # type: ignore[method-assign]
-        node._is_connect_generation_invalid = replacement_validation  # type: ignore[method-assign]
+        node._connect = barrier.connect_then_arm(candidate="node-1", connect=node._connect)  # type: ignore[method-assign]
+        node._is_connect_generation_invalid = barrier.delegated_validation_then_block(  # type: ignore[method-assign]
+            candidate="node-1",
+            validate=node._is_connect_generation_invalid,
+        )
 
-        barrier.uninstall(node)  # type: ignore[arg-type]
+        self.assertEqual(await node._connect(), "original-connect")
+        blocked_validation = asyncio.create_task(node._is_connect_generation_invalid())
+        await asyncio.wait_for(barrier.all_candidates_blocked.wait(), timeout=1.0)
+        self.assertFalse(blocked_validation.done())
+        barrier.release()
+        self.assertEqual(await asyncio.wait_for(blocked_validation, timeout=1.0), "original-validation")
 
-        self.assertIs(node._connect, replacement_connect)
-        self.assertIs(node._is_connect_generation_invalid, replacement_validation)
+        node._connect = original_connect  # type: ignore[method-assign]
+        node._is_connect_generation_invalid = original_validation  # type: ignore[method-assign]
+        self.assertIs(node._connect.__self__, original_connect.__self__)
+        self.assertIs(node._connect.__func__, original_connect.__func__)
+        self.assertIs(node._is_connect_generation_invalid.__self__, original_validation.__self__)
+        self.assertIs(node._is_connect_generation_invalid.__func__, original_validation.__func__)
 
     async def test_pre_ready_close_then_handshake_failure_handler_sequences_connections(self) -> None:
         reconnect_attempted = asyncio.Event()
